@@ -1,0 +1,154 @@
+// wtevent_tests.nv — the rename, and the two events nobody handles.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: watch-nv.wtevent.<fn>`.
+//
+// THE PAIRING CASES ARE WHY THE FILE EXISTS.  A rename arrives as two
+// events that may be split across reads and may never have a partner,
+// and a watcher that reported the halves makes every consumer pair them
+// — badly.  All three shapes are here: both halves in one batch, the two
+// halves in separate batches, and a half whose partner never comes.
+//
+// AND THE OVERFLOW.  `demands_rescan` is the branch a consumer forgets,
+// and forgetting it costs a build that is silently stale after every
+// large checkout.  It is asserted directly rather than inferred from a
+// loop.
+
+use std.test
+use std.list
+use wtevent
+
+fn moved_from(path: Str, cookie: Int) -> WtRawEvent
+    wtevent.raw(WtRawMovedFrom, path, false, cookie, 1)
+
+fn moved_to(path: Str, cookie: Int) -> WtRawEvent
+    wtevent.raw(WtRawMovedTo, path, false, cookie, 1)
+
+@test
+fn test_both_halves_in_one_batch_pair_into_one_event() [io]
+    let (events, after) = wtevent.pair(wtevent.default_pairing(),
+                                       [moved_from("a.nv", 7), moved_to("b.nv", 7)],
+                                       1757548800.0)
+
+    test.case("one event, not two")
+    test.assert(list.len(events) == 1)
+
+    test.case("carrying both paths, which is what a consumer needs to invalidate")
+    test.assert(list.len(wtevent.paths_of(events[0])) == 2)
+
+    test.case("and nothing is left waiting")
+    test.assert(wtevent.pending_count(after) == 0)
+
+@test
+fn test_halves_in_separate_batches_still_pair() [io]
+    let (first, mid) = wtevent.pair(wtevent.default_pairing(),
+                                    [moved_from("a.nv", 7)], 1757548800.0)
+
+    test.case("the first batch yields nothing and holds the half")
+    test.assert(list.len(first) == 0)
+    test.assert(wtevent.pending_count(mid) == 1)
+
+    let (second, after) = wtevent.pair(mid, [moved_to("b.nv", 7)], 1757548800.01)
+
+    test.case("the second batch completes it")
+    test.assert(list.len(second) == 1)
+    test.assert(wtevent.pending_count(after) == 0)
+
+@test
+fn test_a_half_whose_partner_never_comes_becomes_a_move_out() [io]
+    let (_, held) = wtevent.pair(wtevent.default_pairing(),
+                                 [moved_from("a.nv", 7)], 1757548800.0)
+
+    test.case("it waits inside the window")
+    let (early, still) = wtevent.expire(held, 1757548800.1)
+    test.assert(list.len(early) == 0)
+    test.assert(wtevent.pending_count(still) == 1)
+
+    test.case("and is released past it, as a move out rather than a rename")
+    let (late, empty) = wtevent.expire(still, 1757548801.0)
+    test.assert(list.len(late) == 1)
+    test.assert(wtevent.pending_count(empty) == 0)
+    test.assert(wtevent.is_disappearance(late[0]))
+
+@test
+fn test_two_renames_with_different_cookies_do_not_cross() [io]
+    let (events, _) = wtevent.pair(wtevent.default_pairing(),
+                                   [moved_from("a.nv", 7), moved_from("c.nv", 9),
+                                    moved_to("d.nv", 9), moved_to("b.nv", 7)],
+                                   1757548800.0)
+
+    test.case("two renames, paired by cookie and not by order")
+    test.assert(list.len(events) == 2)
+
+@test
+fn test_an_overflow_demands_a_rescan_and_says_so() [io]
+    let overflow = wtevent.event(WtOverflow(0), "", true, 1757548800.0, 1)
+
+    test.case("the branch a consumer forgets")
+    test.assert(wtevent.demands_rescan(overflow))
+
+    test.case("a lost watch does too, because the watcher is now blind")
+    test.assert(wtevent.demands_rescan(
+        wtevent.event(WtWatchLost("unmounted"), "", true, 0.0, 1)))
+
+    test.case("and an ordinary change does not")
+    test.assert(wtevent.demands_rescan(
+        wtevent.event(WtModified, "a.nv", false, 0.0, 1)) == false)
+
+@test
+fn test_appearance_and_disappearance_cover_the_arms_a_match_gets_wrong() [io]
+    test.case("created and moved in are appearances")
+    test.assert(wtevent.is_appearance(wtevent.event(WtCreated, "a", false, 0.0, 1)))
+    test.assert(wtevent.is_appearance(wtevent.event(WtMovedIn, "a", false, 0.0, 1)))
+
+    test.case("removed and moved out are disappearances")
+    test.assert(wtevent.is_disappearance(wtevent.event(WtRemoved, "a", false, 0.0, 1)))
+    test.assert(wtevent.is_disappearance(wtevent.event(WtMovedOut, "a", false, 0.0, 1)))
+
+    test.case("a rename is BOTH, because one path went and another arrived")
+    let renamed = wtevent.event(WtRenamed("a", "b"), "b", false, 0.0, 1)
+    test.assert(wtevent.is_appearance(renamed))
+    test.assert(wtevent.is_disappearance(renamed))
+
+    test.case("and a modification is neither")
+    test.assert(wtevent.is_appearance(wtevent.event(WtModified, "a", false, 0.0, 1)) == false)
+    test.assert(wtevent.is_disappearance(wtevent.event(WtModified, "a", false, 0.0, 1)) == false)
+
+@test
+fn test_an_ordinary_event_is_about_one_path() [io]
+    test.case("one")
+    test.assert(list.len(wtevent.paths_of(
+        wtevent.event(WtModified, "src/main.nv", false, 0.0, 1))) == 1)
+
+@test
+fn test_raw_events_carry_through_to_paired_ones() [io]
+    let (events, _) = wtevent.pair(wtevent.default_pairing(),
+                                   [wtevent.raw(WtRawCreated, "a.nv", false, 0, 1),
+                                    wtevent.raw(WtRawModified, "a.nv", false, 0, 1)],
+                                   1757548800.0)
+
+    test.case("two non-move events go through as two")
+    test.assert(list.len(events) == 2)
+
+    test.case("stamped with the caller's one clock reading")
+    test.assert(events[0].at_unix == 1757548800.0)
+
+@test
+fn test_metadata_is_its_own_kind() [io]
+    test.case("because a build tool does not care and a backup tool does")
+    test.assert(wtevent.kind_name(WtMetadata) != wtevent.kind_name(WtModified))
+
+@test
+fn test_every_kind_names_itself() [io]
+    test.case("for a log line and for a --json output")
+    test.assert(wtevent.kind_name(WtCreated) == "created")
+    test.assert(wtevent.kind_name(WtRemoved) == "removed")
+    test.assert(wtevent.kind_name(WtOverflow(0)) != "")
+
+@test
+fn test_the_pairing_window_is_a_value_the_caller_chooses() [io]
+    test.case("the default is half a second")
+    test.assert(wtevent.default_pairing().window_seconds == 0.5)
+
+    test.case("and a caller that knows its machine can say otherwise")
+    test.assert(wtevent.pairing(2.0).window_seconds == 2.0)

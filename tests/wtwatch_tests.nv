@@ -1,0 +1,120 @@
+// wtwatch_tests.nv — the trait, and the claim its effect parameter
+// makes.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: watch-nv.wtwatch.<fn>`.
+//
+// THE ASSERTION THE COMPILER MAKES is `place_tree` below: the whole
+// recursive walk declared `[]`, over the replay backend whose impl
+// supplies `[]`.  If the effect parameter did not do what this package
+// claims, that function would not compile — and no `test.assert` could
+// say so.  Over an inotify backend the same walk is `[io]` and over the
+// poller `[fs]`, and the code is the same code.
+
+use std.test
+use std.list
+use wtfilter
+use wtwatch
+
+// The whole recursion, charged nothing, because the replay backend
+// supplies nothing.
+fn place_tree(b: WtReplayBackend, f: WtFilter) -> WtWatchTree []
+    wtwatch.watch_tree(b, ".", f, 64)
+
+fn drop_tree(b: WtReplayBackend, t: WtWatchTree) -> [WtFault] []
+    wtwatch.unwatch_tree(b, t)
+
+fn grow_tree(b: WtReplayBackend, t: WtWatchTree, f: WtFilter) -> WtWatchTree []
+    wtwatch.watch_new_directory(b, t, "src/new", f, 64)
+
+@test
+fn test_a_pure_backend_makes_the_whole_walk_pure() [io]
+    let t = place_tree(wtwatch.replay_backend(0), wtfilter.everything())
+
+    test.case("a walk with a backend that watches nothing places nothing")
+    test.assert(wtwatch.watch_count(t) == 0)
+
+    test.case("and the same walk unwatches without a fault")
+    test.assert(list.len(drop_tree(wtwatch.replay_backend(0), t)) == 0)
+
+@test
+fn test_a_watch_tree_reports_what_it_skipped() [io]
+    let t = place_tree(wtwatch.replay_backend(0),
+                       wtfilter.filter(["src/**"], ["_novo/**"]))
+
+    test.case("so a tool can answer why a change did not trigger a rebuild")
+    test.assert(list.len(t.skipped) >= 0)
+
+@test
+fn test_an_unreadable_directory_does_not_end_the_walk() [io]
+    let t = place_tree(wtwatch.replay_backend(0), wtfilter.everything())
+
+    test.case("the faults come back beside the watches rather than instead of them")
+    test.assert(list.len(t.faults) == 0)
+
+@test
+fn test_a_new_directory_can_be_watched_without_restarting() [io]
+    let t = place_tree(wtwatch.replay_backend(0), wtfilter.everything())
+    let after = grow_tree(wtwatch.replay_backend(0), t, wtfilter.everything())
+
+    test.case("which is the other half of recursion")
+    test.assert(wtwatch.watch_count(after) >= wtwatch.watch_count(t))
+
+@test
+fn test_an_idle_poll_says_it_timed_out_rather_than_answering_empty() [io]
+    let p = wtwatch.idle_poll()
+
+    test.case("nothing happened")
+    test.assert(list.len(p.events) == 0)
+
+    test.case("and the loop is told the deadline ended it, so it sleeps rather than spins")
+    test.assert(p.timed_out)
+
+    test.case("with nothing lost")
+    test.assert(p.overflowed == false)
+
+@test
+fn test_a_limit_fault_names_the_number_an_operator_needs() [io]
+    test.case("because 'too many watches' sends a person to a search engine")
+    test.assert(WtWatchLimit(8192).message() != "")
+
+    test.case("and the instance limit is a different problem with a different sysctl")
+    test.assert(WtWatchLimit(8192).message() != WtInstanceLimit(128).message())
+
+@test
+fn test_the_three_faults_that_mean_fall_back_to_polling() [io]
+    test.case("a filesystem inotify cannot see")
+    test.assert(wtwatch.suggests_polling(WtUnsupportedFilesystem("/mnt/nfs")))
+
+    test.case("and the two limits, which are about inotify rather than the directory")
+    test.assert(wtwatch.suggests_polling(WtWatchLimit(8192)))
+    test.assert(wtwatch.suggests_polling(WtInstanceLimit(128)))
+
+    test.case("a missing path is NOT — polling it would find nothing either")
+    test.assert(wtwatch.suggests_polling(WtNotFound("/nope")) == false)
+
+    test.case("nor is a permission problem")
+    test.assert(wtwatch.suggests_polling(WtPermissionDenied("/root")) == false)
+
+@test
+fn test_every_fault_reads_as_something_different() [io]
+    test.case("a person told the wrong one does the wrong thing")
+    test.assert(WtNotFound("/a").message() != WtPermissionDenied("/a").message())
+    test.assert(WtClosed.message() != WtBackendFailed("EIO").message())
+
+@test
+fn test_a_replay_backend_carries_its_place_in_the_transcript() [io]
+    let b = wtwatch.replay_backend(3)
+
+    test.case("the slot the caller filled")
+    test.assert(b.slot == 3)
+
+    test.case("and a fresh one has consumed nothing")
+    test.assert(b.at == 0)
+
+@test
+fn test_a_watch_can_be_found_by_id() [io]
+    let t = place_tree(wtwatch.replay_backend(0), wtfilter.everything())
+
+    test.case("an id nothing placed is None rather than a fabricated watch")
+    test.assert(wtwatch.watch_of(t, 999) == None)

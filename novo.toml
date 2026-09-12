@@ -1,0 +1,55 @@
+[package]
+name        = "watch-nv"
+license     = "Apache-2.0"
+version     = "0.0.1"
+description = "Filesystem watching: an event model in which a rename is one event with two paths, include and exclude decided before a directory is watched rather than after it reports, debouncing as a value with the clock supplied, an inotify backend and a portable polling one behind one trait, and the run-on-change loop a --watch mode is."
+
+# `license` sits immediately after the name, before any value that could
+# contain a square bracket.  The publish reads it with a pattern that
+# stops at the first `[`, so a description naming an effect row hides it
+# and the release records no licence at all — silently.
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and three of the seven modules declare NOTHING: the event
+# model, the filter and the debouncer are arithmetic over values the
+# caller already holds — which is what lets the rename pairing, the
+# ignore decision and the coalescing window all be tested in
+# microseconds with no filesystem and no sleep.
+#
+# The rows the rest declare are NOT the `[io, time]` the plan's row
+# guessed, and the difference is worth reading: the inotify backend is
+# `[io]` because a watch is a file descriptor, the polling backend is
+# `[fs]` because it reads directories, and `[time]` appears in exactly
+# two places — the clock reading a debouncer is given, and the loop's
+# own wait.  A caller that supplies both from outside pays neither.
+layer       = "host"
+
+category    = "tooling"
+
+tags        = ["watch", "inotify", "filesystem", "debounce", "hot-reload", "notify"]
+repository  = "https://github.com/novolang/watch-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Watching a directory, and what the events mean"
+
+[dependencies]
+# The include and exclude patterns, by registry range.
+#
+# WHY A DEPENDENCY RATHER THAN A STRING COMPARISON.  The filter decides
+# two different questions and both need a real matcher: whether an event
+# is interesting, and — the one that matters — whether to DESCEND into a
+# directory at all.  `glob.may_descend` is exactly the second, and it is
+# the difference between twenty inotify watches and two hundred thousand
+# in a repository with a build directory nobody excluded.
+glob-nv = "^0.1.1"

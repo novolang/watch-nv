@@ -1,0 +1,314 @@
+// wtevent.nv — what happened, and the three things a watcher has to be
+// able to say that a naive event model cannot.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A RENAME IS ONE EVENT WITH TWO PATHS, AND THE BACKEND DOES NOT SEND
+// IT THAT WAY.  inotify delivers a rename as two events — `MOVED_FROM`
+// and `MOVED_TO` sharing a cookie — which may arrive in separate reads,
+// and which are NOT both there when the file moved out of the watched
+// tree or in from outside it.  A watcher that reported the two raw
+// events makes every consumer pair them, and every consumer pairs them
+// wrongly: a build tool sees a delete followed by an add and rebuilds
+// from scratch where nothing changed.
+//
+// So `WtRenamed(from, to)` is the paired event, `WtMovedOut` and
+// `WtMovedIn` are the honest halves for the cases where there is no
+// partner, and `wtevent.pair` is the state machine that decides —
+// with a deadline, because a `MOVED_FROM` whose partner never comes has
+// to become a `WtMovedOut` eventually or the watcher holds it forever.
+//
+// THE QUEUE OVERFLOWS, AND THAT IS AN EVENT.  inotify's queue is bounded
+// (`/proc/sys/fs/inotify/max_queued_events`, 16384 by default) and the
+// kernel drops events and sends `IN_Q_OVERFLOW` when it fills — which a
+// `git checkout` of a large branch does routinely.  A watcher without a
+// `WtOverflow` arm silently misses changes, and the symptom is a build
+// that is stale in a way nothing explains.  The only correct response is
+// a full rescan, and a consumer can only make it if it is told.
+//
+// A DIRECTORY EVENT IS NOT A FILE EVENT.  `WtEvent.is_directory` is on
+// every event because a recursive watcher has to add a watch when a
+// directory is created — and the window between the `mkdir` and the
+// watch being added is a real gap in which events are lost.  See the
+// README's § What recursion costs.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// What happened to a path.
+pub enum WtEventKind
+    // The path did not exist and now does.
+    WtCreated
+    // The path's contents changed.  A backend may send several of these
+    // for one logical write, which is what `wtdebounce` is for.
+    WtModified
+    // The path's metadata changed: mode, owner, times.  Separate from
+    // `WtModified` because a build tool does not care and a backup tool
+    // does, and a watcher that merged them makes the first rebuild on
+    // every `chmod`.
+    WtMetadata
+    // The path no longer exists.
+    WtRemoved
+    // Renamed within the watched tree: both paths are known.
+    WtRenamed(from: Str, to: Str)
+    // Renamed to somewhere outside the watched tree, or the partner
+    // never arrived.  A consumer treats it as a removal and knows that
+    // is what it is doing.
+    WtMovedOut
+    // Renamed in from outside the watched tree.  A consumer treats it as
+    // a creation.
+    WtMovedIn
+    // The backend lost events.  `dropped` is how many, when the backend
+    // can say, and `0` when it cannot — which inotify cannot.  The only
+    // correct response is a full rescan.
+    WtOverflow(dropped: Int)
+    // The watch itself went away: the watched directory was removed or
+    // the filesystem was unmounted.  Distinct from `WtRemoved` because
+    // the watcher is now blind rather than merely informed.
+    WtWatchLost(reason: Str)
+
+// One thing that happened.
+//
+// `path` is relative to the root the watch was created on, always —
+// absolute paths would make an event's meaning depend on where the
+// process was started, and the first thing every consumer does with an
+// absolute path is make it relative again.
+pub struct WtEvent
+    kind: WtEventKind
+    path: Str
+    // Whether the path is (or was) a directory.  What a recursive
+    // watcher branches on to add or drop a watch.
+    is_directory: Bool
+    // The instant the backend reported it, in Unix epoch seconds, as
+    // the CALLER read the clock — the backends do not stamp events
+    // themselves, because a backend that read the clock would charge
+    // `[time]` to every read and a batch of four hundred events would
+    // read it four hundred times.
+    at_unix: Float
+    // Which watch produced it, for a caller watching several roots.
+    watch_id: Int
+
+// The state a rename pairing carries between reads.
+//
+// A value, so a caller that drains the backend in its own loop threads
+// one of these and nothing is hidden.
+pub struct WtPairing
+    // `MOVED_FROM` events seen and not yet matched, with the cookie the
+    // backend gave them.
+    pending: [WtPendingMove]
+    // How long an unmatched half waits before it becomes a
+    // `WtMovedOut`.  Git's own checkout can put a second between the
+    // two halves on a loaded machine; a window under that turns renames
+    // into delete-and-add pairs, and one far over it delays every real
+    // move.
+    window_seconds: Float
+
+// One half of a rename, waiting for its partner.
+pub struct WtPendingMove
+    cookie: Int
+    path: Str
+    is_directory: Bool
+    at_unix: Float
+    watch_id: Int
+
+// A raw event as a backend reports it, before pairing.
+//
+// The backends answer these and `pair` turns them into `WtEvent`s.  Two
+// types rather than one, because a raw move has a cookie and no partner
+// and a `WtEvent` has a partner and no cookie — and a single type
+// carrying both would have two fields that are never both meaningful.
+pub struct WtRawEvent
+    kind: WtRawKind
+    path: Str
+    is_directory: Bool
+    // `0` when the kind is not a move half.
+    cookie: Int
+    watch_id: Int
+
+// What a backend saw, before anything was paired.
+pub enum WtRawKind
+    WtRawCreated
+    WtRawModified
+    WtRawMetadata
+    WtRawRemoved
+    WtRawMovedFrom
+    WtRawMovedTo
+    WtRawOverflow
+    WtRawWatchLost
+
+// A pairing state with this window.
+//
+// ```novo
+// use wtevent
+//
+// fn main() [io]
+//     println("${wtevent.pairing(0.5).window_seconds}")
+// ```
+pub fn pairing(window_seconds: Float) -> WtPairing []
+    todo("watch-nv.wtevent.pairing")
+
+// The default pairing window: half a second.
+//
+// Long enough that a `git checkout` on a loaded machine still pairs its
+// moves, short enough that a genuine move out of the tree is reported
+// inside a human's patience.
+//
+// ```novo
+// use wtevent
+//
+// fn main() [io]
+//     println("${wtevent.default_pairing().window_seconds}")
+// ```
+pub fn default_pairing() -> WtPairing []
+    todo("watch-nv.wtevent.default_pairing")
+
+// Feed a batch of raw events and drain the paired ones.
+//
+// Feed and drain, `[]`: the backend read the events and this decides
+// what they mean.  A `MOVED_FROM` with no partner in the batch stays in
+// the pairing state; `expire` is what eventually releases it.
+//
+// `now_unix` is the caller's clock reading, used to stamp the events and
+// to age the pending halves — one reading per batch rather than one per
+// event.
+//
+// ```novo
+// use wtevent
+//
+// fn drain(p: WtPairing, raw: [WtRawEvent]) -> ([WtEvent], WtPairing)
+//     wtevent.pair(p, raw, 1757548800.0)
+//
+// fn main() [io]
+//     println("raw events, paired")
+// ```
+pub fn pair(p: WtPairing, raw: [WtRawEvent], now_unix: Float) -> ([WtEvent], WtPairing) []
+    todo("watch-nv.wtevent.pair")
+
+// Release the pending halves whose window has passed, as `WtMovedOut`.
+//
+// Called by a loop that is otherwise idle, because a rename out of the
+// tree produces no further event to carry the release — so a watcher
+// that only expired on the next batch would hold the event until
+// something else happened, which in a quiet tree is never.
+//
+// ```novo
+// use wtevent
+//
+// fn age(p: WtPairing) -> ([WtEvent], WtPairing)
+//     wtevent.expire(p, 1757548801.0)
+//
+// fn main() [io]
+//     println("the moves whose partner never came")
+// ```
+pub fn expire(p: WtPairing, now_unix: Float) -> ([WtEvent], WtPairing) []
+    todo("watch-nv.wtevent.expire")
+
+// How many halves are waiting for a partner.
+//
+// Published so a caller can assert it is zero after a quiet period
+// rather than trusting that the pairing drained.
+//
+// ```novo
+// use wtevent
+//
+// fn main() [io]
+//     println("${wtevent.pending_count(wtevent.default_pairing())}")
+// ```
+pub fn pending_count(p: WtPairing) -> Int []
+    todo("watch-nv.wtevent.pending_count")
+
+// An event.
+//
+// ```novo
+// use wtevent
+//
+// fn main() [io]
+//     println(wtevent.event(WtCreated, "src/main.nv", false, 0.0, 1).path)
+// ```
+pub fn event(kind: WtEventKind, path: Str, is_directory: Bool, at_unix: Float,
+             watch_id: Int) -> WtEvent []
+    todo("watch-nv.wtevent.event")
+
+// A raw event, as a backend reports one.
+//
+// ```novo
+// use wtevent
+//
+// fn main() [io]
+//     println(wtevent.raw(WtRawCreated, "src/main.nv", false, 0, 1).path)
+// ```
+pub fn raw(kind: WtRawKind, path: Str, is_directory: Bool, cookie: Int,
+           watch_id: Int) -> WtRawEvent []
+    todo("watch-nv.wtevent.raw")
+
+// Does this event mean a consumer must rescan?
+//
+// `WtOverflow` and `WtWatchLost`, and nothing else.  Published as a
+// predicate rather than left to a `match`, because it is the one branch
+// a consumer forgets and the cost of forgetting it is a build that is
+// silently stale.
+//
+// ```novo
+// use wtevent
+//
+// fn main() [io]
+//     println("${wtevent.demands_rescan(wtevent.event(WtOverflow(0), "", true, 0.0, 1))}")
+// ```
+pub fn demands_rescan(e: WtEvent) -> Bool []
+    todo("watch-nv.wtevent.demands_rescan")
+
+// Every path this event is about.
+//
+// One for most kinds and TWO for a rename, which is the whole reason it
+// exists: a consumer invalidating a cache has to invalidate both ends,
+// and a consumer that read `event.path` alone invalidates the wrong one.
+//
+// ```novo
+// use wtevent
+//
+// fn touched(e: WtEvent) -> [Str]
+//     wtevent.paths_of(e)
+//
+// fn main() [io]
+//     println("every path an event is about")
+// ```
+pub fn paths_of(e: WtEvent) -> [Str] []
+    todo("watch-nv.wtevent.paths_of")
+
+// Does this event mean the path now exists?
+//
+// `WtCreated`, `WtMovedIn`, and the `to` side of a rename.  A consumer
+// deciding whether to read a file wants this rather than a four-arm
+// `match` it will get wrong once.
+//
+// ```novo
+// use wtevent
+//
+// fn main() [io]
+//     println("${wtevent.is_appearance(wtevent.event(WtCreated, "a", false, 0.0, 1))}")
+// ```
+pub fn is_appearance(e: WtEvent) -> Bool []
+    todo("watch-nv.wtevent.is_appearance")
+
+// Does this event mean the path no longer exists?
+//
+// `WtRemoved`, `WtMovedOut`, and the `from` side of a rename.
+//
+// ```novo
+// use wtevent
+//
+// fn main() [io]
+//     println("${wtevent.is_disappearance(wtevent.event(WtRemoved, "a", false, 0.0, 1))}")
+// ```
+pub fn is_disappearance(e: WtEvent) -> Bool []
+    todo("watch-nv.wtevent.is_disappearance")
+
+// The kind as one lowercase word, for a log line or a `--json` output.
+//
+// ```novo
+// use wtevent
+//
+// fn main() [io]
+//     println(wtevent.kind_name(WtCreated))
+// ```
+pub fn kind_name(k: WtEventKind) -> Str []
+    todo("watch-nv.wtevent.kind_name")

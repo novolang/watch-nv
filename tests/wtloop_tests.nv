@@ -1,0 +1,167 @@
+// wtloop_tests.nv — the loop, and the row the compiler insisted on.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: watch-nv.wtloop.<fn>`.
+//
+// THE ASSERTION THE COMPILER MAKES is `tick` below: one turn of a watch
+// loop declared `[]`, over the replay backend.  That is the whole claim
+// of this package in one signature — a tool's watch behaviour is
+// testable with no filesystem, no clock and no sleep.
+//
+// AND THE ONE BESIDE IT.  `run_on_change` is `[e, io, time]` and the
+// `[io]` is the ACTION's: a function-typed parameter's row is charged to
+// whoever calls through it, so the loop that runs an `[io]` action is
+// `[io]`.  The first spelling of that signature left it out and the
+// compiler refused — on a package with no bodies in it, which is what
+// interfaces-first is for.
+
+use std.test
+use std.list
+use wtdebounce
+use wtevent
+use wtfilter
+use wtloop
+use wtwatch
+
+fn rebuild(events: [WtEvent]) -> Bool [io]
+    list.len(events) >= 0
+
+// One turn, charged nothing, because the replay backend supplies
+// nothing and the clock reading is the caller's.
+fn tick(b: WtReplayBackend, s: WtLoopState) -> Result<(WtTurn, WtLoopState), WtFault> []
+    wtloop.step(b, s, 1757548800.0)
+
+fn begin(b: WtReplayBackend) -> Result<WtLoopState, WtFault> []
+    wtloop.start(b, ".", wtloop.default_config())
+
+fn again(b: WtReplayBackend, s: WtLoopState) -> Result<WtLoopState, WtFault> []
+    wtloop.rescan(b, s)
+
+fn finish(b: WtReplayBackend, s: WtLoopState) -> Result<Unit, WtFault> []
+    wtloop.stop(b, s)
+
+// The whole mode, charged the backend's row plus the action's plus the
+// clock — which over a replay backend is `[io, time]` and no filesystem.
+fn whole(b: WtReplayBackend) -> Result<Int, WtFault> [io, time]
+    wtloop.run_on_change(b, ".", wtloop.default_config(), rebuild)
+
+@test
+fn test_the_defaults_are_what_a_watch_mode_wants() [io]
+    let c = wtloop.default_config()
+
+    test.case("build first, then watch")
+    test.assert(c.run_at_start)
+
+    test.case("follow directories that appear, or a new package is never noticed")
+    test.assert(c.follow_new_directories)
+
+    test.case("and a bounded poll, so the expiry calls run in a quiet tree")
+    test.assert(c.poll_seconds > 0.0)
+
+@test
+fn test_a_configuration_is_built_from_a_filter_and_then_adjusted() [io]
+    let c = wtloop.config(wtfilter.filter(["**/*.nv"], ["_novo/**"]))
+
+    test.case("the filter it was given")
+    test.assert(list.len(c.filter.exclude) == 1)
+
+    test.case("a different debounce")
+    test.assert(wtloop.with_debounce(c, wtdebounce
+                .debounce(0.1, 1.0)).debounce.quiet_seconds == 0.1)
+
+    test.case("and a different poll interval, with the filter kept")
+    let faster = wtloop.with_poll_interval(c, 0.25)
+    test.assert(faster.poll_seconds == 0.25)
+    test.assert(list.len(faster.filter.exclude) == 1)
+
+@test
+fn test_a_session_begins_with_its_watches_placed() [io]
+    match begin(wtwatch.replay_backend(0))
+        Ok(s)  =>
+            test.case("the root it was given")
+            test.assert(s.root == ".")
+
+            test.case("and no turns yet")
+            test.assert(s.turns == 0)
+
+        Err(_) => test.assert(false)
+
+@test
+fn test_one_turn_over_a_pure_backend_costs_nothing() [io]
+    match begin(wtwatch.replay_backend(0))
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.case("the turn runs, charged nothing — which is the whole claim")
+            match tick(wtwatch.replay_backend(0), s)
+                Ok((turn, after)) =>
+                    test.assert(list.len(turn.events) == 0)
+                    test.assert(after.turns == 1)
+                Err(_)            => test.assert(false)
+
+@test
+fn test_a_turn_that_did_nothing_is_not_worth_a_line() [io]
+    let quiet = WtTurn { events: [], acted: false, rescanned: false,
+                         watches_added: 0, faults: [] }
+
+    test.case("or a watch mode prints one a second forever")
+    test.assert(wtloop.turn_is_notable(quiet) == false)
+
+@test
+fn test_a_turn_that_acted_or_rescanned_or_faulted_is() [io]
+    test.case("it acted")
+    test.assert(wtloop.turn_is_notable(
+        WtTurn { events: [], acted: true, rescanned: false,
+                 watches_added: 0, faults: [] }))
+
+    test.case("it rescanned, which a person needs to know about")
+    test.assert(wtloop.turn_is_notable(
+        WtTurn { events: [], acted: false, rescanned: true,
+                 watches_added: 0, faults: [] }))
+
+    test.case("it added a watch")
+    test.assert(wtloop.turn_is_notable(
+        WtTurn { events: [], acted: false, rescanned: false,
+                 watches_added: 3, faults: [] }))
+
+    test.case("and it met a fault it carried on past")
+    test.assert(wtloop.turn_is_notable(
+        WtTurn { events: [], acted: false, rescanned: false,
+                 watches_added: 0, faults: [WtPermissionDenied("/root")] }))
+
+@test
+fn test_a_turn_describes_itself_rather_than_printing() [io]
+    let acted = WtTurn { events: [wtevent.event(WtModified, "src/main.nv", false, 0.0, 1)],
+                         acted: true, rescanned: false, watches_added: 0, faults: [] }
+
+    test.case("the text comes back, so it can go to a terminal, a log and a test")
+    test.assert(wtloop.describe_turn(acted) != "")
+
+@test
+fn test_the_wait_is_the_sooner_of_the_two_deadlines() [io]
+    match begin(wtwatch.replay_backend(0))
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.case("with nothing pending it is the poll interval")
+            test.assert(wtloop.wait_seconds(s, 1757548800.0)
+                        == s.config.poll_seconds)
+
+@test
+fn test_a_session_can_be_rescanned_and_stopped() [io]
+    match begin(wtwatch.replay_backend(0))
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.case("an overflow's answer: re-place every watch")
+            match again(wtwatch.replay_backend(0), s)
+                Ok(after) => test.assert(after.root == ".")
+                Err(_)    => test.assert(false)
+
+            test.case("and the session ends by releasing them")
+            match finish(wtwatch.replay_backend(0), s)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(false)
+
+// The one row in this package that reads the clock, named with the
+// `[time]` it declares.  Everything else takes the reading, which is
+// what makes the whole of the file above run with no clock at all.
+fn stamp() -> Float [time]
+    wtloop.now_unix()

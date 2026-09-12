@@ -1,0 +1,135 @@
+// wtpoll_tests.nv — two snapshots, compared, with no directory anywhere.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: watch-nv.wtpoll.<fn>`.
+//
+// THE mtime-WENT-BACKWARDS CASE IS THE ONE.  A checkout, a restore from
+// a backup and an `rsync --times` all write files whose mtime is OLDER
+// than what was there, and a comparison written `new > old` reports that
+// nothing happened — silently, on exactly the operations after which a
+// person most wants a rebuild.  It is `!=`, and it is asserted here
+// rather than argued in a comment.
+
+use std.test
+use std.list
+use wtevent
+use wtfilter
+use wtpoll
+
+fn file_at(path: Str, size: Int, mtime: Int) -> WtStatEntry
+    wtpoll.entry(path, false, size, mtime, 0, 33188)
+
+fn shot(entries: [WtStatEntry], at: Float) -> WtSnapshot
+    wtpoll.snapshot(".", entries, at)
+
+@test
+fn test_an_empty_snapshot_reports_everything_as_created() [io]
+    let after = shot([file_at("src/main.nv", 42, 1757548800)], 1.0)
+
+    test.case("which is correct, and is what a watch mode wants at startup")
+    let events = wtpoll.diff_snapshots(wtpoll.empty_snapshot(".", 0.0), after)
+    test.assert(list.len(events) == 1)
+    test.assert(wtevent.is_appearance(events[0]))
+
+@test
+fn test_two_identical_snapshots_produce_nothing() [io]
+    let a = shot([file_at("src/main.nv", 42, 1757548800)], 1.0)
+    let b = shot([file_at("src/main.nv", 42, 1757548800)], 2.0)
+
+    test.case("nothing changed, so nothing is reported")
+    test.assert(list.len(wtpoll.diff_snapshots(a, b)) == 0)
+
+@test
+fn test_an_mtime_that_went_backwards_is_a_change() [io]
+    let before = file_at("src/main.nv", 42, 1757548900)
+    let after = file_at("src/main.nv", 42, 1757548800)
+
+    test.case("a checkout writes an older mtime, and `new > old` would miss it")
+    test.assert(wtpoll.entry_changed(before, after))
+
+    test.case("and the comparison reports it as a modification")
+    let events = wtpoll.diff_snapshots(shot([before], 1.0), shot([after], 2.0))
+    test.assert(list.len(events) == 1)
+    test.assert(events[0].kind == WtModified)
+
+@test
+fn test_a_size_or_a_mode_change_is_a_change() [io]
+    let base = file_at("src/main.nv", 42, 1757548800)
+
+    test.case("a different size")
+    test.assert(wtpoll.entry_changed(base, file_at("src/main.nv", 43, 1757548800)))
+
+    test.case("and a different mode, which is a metadata change")
+    let chmodded = wtpoll.entry("src/main.nv", false, 42, 1757548800, 0, 33261)
+    test.assert(wtpoll.entry_changed(base, chmodded))
+
+    let events = wtpoll.diff_snapshots(shot([base], 1.0), shot([chmodded], 2.0))
+    test.assert(list.len(events) == 1)
+    test.assert(events[0].kind == WtMetadata)
+
+@test
+fn test_a_path_that_vanished_is_a_removal() [io]
+    let before = shot([file_at("src/a.nv", 1, 1), file_at("src/b.nv", 1, 1)], 1.0)
+    let after = shot([file_at("src/a.nv", 1, 1)], 2.0)
+
+    let events = wtpoll.diff_snapshots(before, after)
+
+    test.case("one removal")
+    test.assert(list.len(events) == 1)
+    test.assert(wtevent.is_disappearance(events[0]))
+
+@test
+fn test_a_rename_arrives_as_a_removal_and_a_creation() [io]
+    let before = shot([file_at("src/a.nv", 42, 1757548800)], 1.0)
+    let after = shot([file_at("src/b.nv", 42, 1757548800)], 2.0)
+
+    let events = wtpoll.diff_snapshots(before, after)
+
+    test.case("two events, because nothing in a stat connects two paths")
+    test.assert(list.len(events) == 2)
+
+    test.case("and neither is a rename, which is stated rather than guessed at")
+    test.assert(events[0].kind != WtRenamed("src/a.nv", "src/b.nv"))
+
+@test
+fn test_a_truncated_snapshot_says_so() [io]
+    test.case("because comparing against one would report the rest as deleted")
+    test.assert(shot([], 1.0).truncated == false)
+
+@test
+fn test_the_paths_a_stat_comparison_cannot_settle_are_named() [io]
+    let within = file_at("src/main.nv", 42, 1757548800)
+    let a = shot([within], 1757548800.5)
+    let b = shot([within], 1757548801.0)
+
+    test.case("a file whose mtime is inside the scan's own second, with no size change")
+    test.assert(list.len(wtpoll.rehash_suspicious(a, b)) == 1)
+
+    test.case("and a file comfortably older is not suspicious")
+    let older = file_at("src/old.nv", 42, 1757540000)
+    test.assert(list.len(wtpoll.rehash_suspicious(shot([older], 1757548800.5),
+                                                  shot([older], 1757548801.0))) == 0)
+
+@test
+fn test_a_poller_carries_its_bounds() [io]
+    let p = wtpoll.bounded(wtpoll.poller(".", wtfilter.everything(), 0), 64, 200000)
+
+    test.case("a depth, so a symlink loop is not a hang")
+    test.assert(p.max_depth == 64)
+
+    test.case("and an entry cap, so a two-million-file tree is not read every interval")
+    test.assert(p.max_entries == 200000)
+
+@test
+fn test_the_interval_a_tree_can_be_polled_at_follows_from_its_size() [io]
+    test.case("a small tree can be polled quickly")
+    test.assert(wtpoll.minimum_interval(100) < wtpoll.minimum_interval(1000000))
+
+    test.case("and a scan of a large tree is estimated at something above zero")
+    test.assert(wtpoll.estimated_scan_seconds(1000000) > 0.0)
+
+// The `[fs]` half, named with the row it declares.  A suite that built a
+// tree on disk would be testing the filesystem; the comparison above is
+// where the behaviour is, and it is `[]`.
+fn look(p: WtPoller) -> Result<WtSnapshot, WtFault> [fs]
+    wtpoll.scan(p, 1757548800.0)

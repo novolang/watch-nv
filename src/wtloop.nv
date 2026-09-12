@@ -1,0 +1,330 @@
+// wtloop.nv — the shape a `--watch` mode is.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// EVERY `--watch` MODE IS THE SAME EIGHTY LINES, and every one of them
+// gets two of the same three things wrong.  Poll the backend; pair the
+// renames; filter; debounce; if anything survived, run the action; add
+// watches for directories that appeared; on an overflow, rescan; go
+// round.  The three that are missed: the DIRECTORY-CREATED case, so a
+// new package's files are never noticed; the OVERFLOW case, so a
+// checkout leaves the tool silently stale; and the EXPIRY calls, so a
+// rename out of the tree and the last save before a pause are held
+// forever because nothing else arrived to carry them out.
+//
+// So the loop is published, `run_on_change` is the whole of it, and
+// `step` is the same loop with the sleep taken out for a caller that has
+// its own — a language server, a program that is also serving HTTP.
+//
+// THE ROW IS `[e, io, time]` AND ALL THREE ARE EARNED.  `[e]` is the
+// backend's.  `[time]` is the clock, which `run_on_change` has to read
+// itself, because a debouncer's windows are wall time and a loop that
+// took the reading as an argument would need one per iteration from a
+// caller that has nothing else to do.  `[io]` is the ACTION's: SPEC
+// § 5.5 charges a function-typed parameter's row to whoever calls
+// through it, so a loop that runs a `[io]` action is `[io]` — and the
+// compiler refused the first spelling of this signature, which is the
+// effect system doing exactly what it is for.
+//
+// `step` declares none of the three beyond the backend's: it takes the
+// clock reading and runs no action, so a caller with its own scheduling
+// pays for what it does and a test pays for nothing.
+//
+// THE ACTION IS A NAMED FUNCTION, not a lambda, for the reason
+// `trsample` gives: a lambda that becomes a value is refused at
+// `@tier(embedded)`, and a named function is what a caller writes
+// anyway.  It takes the batch and answers whether to keep going, so a
+// tool stops on a signal, a fatal error or a key without this package
+// owning the decision.
+
+use wtdebounce
+use wtfilter
+use wtwatch
+
+// Everything a loop needs that is not the backend.
+pub struct WtLoopConfig
+    filter: WtFilter
+    debounce: WtDebounce
+    pairing: WtPairing
+    // How long a poll waits before coming back empty-handed.  Bounded
+    // rather than infinite, because the expiry calls have to run in a
+    // quiet tree and a poll that never returns never lets them.
+    poll_seconds: Float
+    // Follow directories created while running.  On by default, and off
+    // for a tool watching a fixed set of files.
+    follow_new_directories: Bool
+    // How deep to descend.
+    max_depth: Int
+    // Run the action once before anything has changed.  What a
+    // `--watch` mode wants — build first, then watch — and what a
+    // linter watching for problems does not.
+    run_at_start: Bool
+
+// What one turn of the loop did.
+pub struct WtTurn
+    // The events the action was given, after pairing, filtering and
+    // debouncing.  Empty when the turn only waited.
+    events: [WtEvent]
+    // The action ran.
+    acted: Bool
+    // Something demanded a rescan, and the loop re-placed its watches.
+    rescanned: Bool
+    // Watches added for directories that appeared.
+    watches_added: Int
+    // Faults the turn met and carried on past — an unreadable
+    // directory, a watch that could not be placed.  Carried rather than
+    // raised, because one bad directory must not end a watch session a
+    // person is depending on.
+    faults: [WtFault]
+
+// The default configuration: everything, the default debounce and
+// pairing, a one-second poll, following new directories to depth 64,
+// running once at start.
+//
+// ```novo
+// use wtloop
+//
+// fn main() [io]
+//     println("${wtloop.default_config().run_at_start}")
+// ```
+pub fn default_config() -> WtLoopConfig []
+    todo("watch-nv.wtloop.default_config")
+
+// A configuration over this filter.
+//
+// ```novo
+// use wtfilter
+// use wtloop
+//
+// fn main() [io]
+//     let c = wtloop.config(wtfilter.filter(["**/*.nv"], ["_novo/**"]))
+//     println("${c.poll_seconds}")
+// ```
+pub fn config(f: WtFilter) -> WtLoopConfig []
+    todo("watch-nv.wtloop.config")
+
+// The same configuration with a different debounce.
+//
+// ```novo
+// use wtdebounce
+// use wtloop
+//
+// fn main() [io]
+//     let c = wtloop.with_debounce(wtloop.default_config(),
+//                                  wtdebounce.debounce(0.1, 1.0))
+//     println("${c.debounce.quiet_seconds}")
+// ```
+pub fn with_debounce(c: WtLoopConfig, d: WtDebounce) -> WtLoopConfig []
+    todo("watch-nv.wtloop.with_debounce")
+
+// The same configuration with a different poll interval.
+//
+// ```novo
+// use wtloop
+//
+// fn main() [io]
+//     println("${wtloop.with_poll_interval(wtloop.default_config(), 0.25).poll_seconds}")
+// ```
+pub fn with_poll_interval(c: WtLoopConfig, seconds: Float) -> WtLoopConfig []
+    todo("watch-nv.wtloop.with_poll_interval")
+
+// Watch a tree and run an action whenever it changes, until the action
+// says to stop.
+//
+// THE ROW IS `[e, io, time]`: the whole of a `--watch` mode, charged
+// what the caller's own backend costs, plus the clock it reads, plus the
+// action's own row — because SPEC § 5.5 charges a function-typed
+// parameter's effects to whoever calls through it.  Over the replay
+// backend that is `[io, time]` and no filesystem at all, which is what
+// lets a test of a tool's watch behaviour run without one.
+//
+// The action's row is FIXED at `[io]`, which is what a build, a test run
+// or a reload actually costs.  A caller whose action needs more — `[net]`
+// to notify a browser, `[fs]` to write a manifest — drives `step` itself
+// and calls its own action, which costs one loop and buys the honest
+// row.
+//
+// ```novo
+// use wtloop
+// use wtwatch
+//
+// fn rebuild(events: [WtEvent]) -> Bool [io]
+//     println("${list.len(events)} changed")
+//     true
+//
+// fn watch_it<B: wtwatch.WatchBackend[e]>(b: B) -> Result<Int, WtFault> [e, io, time]
+//     wtloop.run_on_change(b, ".", wtloop.default_config(), rebuild)
+//
+// fn main() [io]
+//     println("a watch mode, in one call")
+// ```
+pub fn run_on_change<B: WatchBackend[e]>(b: B, root: Str, c: WtLoopConfig,
+                                         action: fn([WtEvent]) -> Bool [io]) -> Result<Int, WtFault> [e, io, time]
+    todo("watch-nv.wtloop.run_on_change")
+
+// One turn of the loop, with the clock reading supplied.
+//
+// `[e]` and NOT `[time]`: the caller reads the clock, which is what lets
+// a program that is also serving HTTP put this in its own event loop and
+// what lets a test drive a whole watch session from literals.
+//
+// Answers the turn and the state to keep — the loop's state is a value,
+// so nothing is hidden and a caller can inspect it between turns.
+//
+// ```novo
+// use wtloop
+// use wtwatch
+//
+// fn tick<B: wtwatch.WatchBackend[e]>(b: B, s: WtLoopState) -> Result<(WtTurn, WtLoopState), WtFault> [e]
+//     wtloop.step(b, s, 1757548800.0)
+//
+// fn main() [io]
+//     println("one turn of a watch loop")
+// ```
+pub fn step<B: WatchBackend[e]>(b: B, s: WtLoopState,
+                                now_unix: Float) -> Result<(WtTurn, WtLoopState), WtFault> [e]
+    todo("watch-nv.wtloop.step")
+
+// The loop's state between turns.
+//
+// A value, and every field is one a caller may want to look at: the
+// watches it holds, what the debouncer is sitting on, what the pairing
+// is waiting for.
+pub struct WtLoopState
+    config: WtLoopConfig
+    tree: WtWatchTree
+    debounce: WtDebounce
+    pairing: WtPairing
+    root: Str
+    // How many turns have run, which is what a `--watch` mode's status
+    // line counts.
+    turns: Int
+
+// Begin a session: place the watches and answer the state.
+//
+// `[e]`.  Separate from `step` so a caller can see what was watched —
+// and what was skipped — before anything runs.
+//
+// ```novo
+// use wtloop
+// use wtwatch
+//
+// fn begin<B: wtwatch.WatchBackend[e]>(b: B) -> Result<WtLoopState, WtFault> [e]
+//     wtloop.start(b, ".", wtloop.default_config())
+//
+// fn main() [io]
+//     println("a watch session, begun")
+// ```
+pub fn start<B: WatchBackend[e]>(b: B, root: Str,
+                                 c: WtLoopConfig) -> Result<WtLoopState, WtFault> [e]
+    todo("watch-nv.wtloop.start")
+
+// Re-place every watch from scratch.
+//
+// What an overflow demands, and the one operation a loop cannot get
+// away without: after `WtOverflow` the watcher does not know what it
+// missed, so the watches are rebuilt and the caller is handed an event
+// saying so.
+//
+// ```novo
+// use wtloop
+// use wtwatch
+//
+// fn again<B: wtwatch.WatchBackend[e]>(b: B, s: WtLoopState) -> Result<WtLoopState, WtFault> [e]
+//     wtloop.rescan(b, s)
+//
+// fn main() [io]
+//     println("the watches, re-placed")
+// ```
+pub fn rescan<B: WatchBackend[e]>(b: B, s: WtLoopState) -> Result<WtLoopState, WtFault> [e]
+    todo("watch-nv.wtloop.rescan")
+
+// End a session: remove every watch and close the backend.
+//
+// ```novo
+// use wtloop
+// use wtwatch
+//
+// fn finish<B: wtwatch.WatchBackend[e]>(b: B, s: WtLoopState) -> Result<Unit, WtFault> [e]
+//     wtloop.stop(b, s)
+//
+// fn main() [io]
+//     println("a watch session, ended")
+// ```
+pub fn stop<B: WatchBackend[e]>(b: B, s: WtLoopState) -> Result<Unit, WtFault> [e]
+    todo("watch-nv.wtloop.stop")
+
+// How long the caller should wait before the next `step`.
+//
+// `[]`, and it is the difference between a loop that sleeps and one that
+// spins: the sooner of the debouncer's next deadline and the poll
+// interval.  A caller with its own event loop passes it to whatever
+// waits.
+//
+// ```novo
+// use wtloop
+//
+// fn nap(s: WtLoopState) -> Float
+//     wtloop.wait_seconds(s, 1757548800.0)
+//
+// fn main() [io]
+//     println("how long to wait before looking again")
+// ```
+pub fn wait_seconds(s: WtLoopState, now_unix: Float) -> Float []
+    todo("watch-nv.wtloop.wait_seconds")
+
+// Did this turn do anything worth reporting?
+//
+// Published because a `--watch` mode that printed a line per turn prints
+// one a second forever, and one that printed only when it acted looks
+// dead during a long build.  The rule — acted, rescanned, added a watch
+// or met a fault — is here rather than reinvented per tool.
+//
+// ```novo
+// use wtloop
+//
+// fn notable(t: WtTurn) -> Bool
+//     wtloop.turn_is_notable(t)
+//
+// fn main() [io]
+//     println("whether a turn is worth a line of output")
+// ```
+pub fn turn_is_notable(t: WtTurn) -> Bool []
+    todo("watch-nv.wtloop.turn_is_notable")
+
+// The clock, as Unix epoch seconds.
+//
+// `[time]`, and it is the only row in this package that reads it.  Every
+// other function that needs an instant takes one, which is what makes
+// the pairing, the debouncing and the snapshot comparison testable
+// without a single sleep.
+//
+// ```novo
+// use wtloop
+//
+// fn stamp() -> Float [time]
+//     wtloop.now_unix()
+//
+// fn main() [io]
+//     println("one clock reading, where it is earned")
+// ```
+pub fn now_unix() -> Float [time]
+    todo("watch-nv.wtloop.now_unix")
+
+// A one-line summary of a turn, for a `--watch` mode's output.
+//
+// `[]` — it answers the text and does not print it, which is
+// `docs/publishing.md` § Design's rule and the reason a tool can send
+// the same line to a terminal, a log and a test.
+//
+// ```novo
+// use wtloop
+//
+// fn line(t: WtTurn) -> Str
+//     wtloop.describe_turn(t)
+//
+// fn main() [io]
+//     println("what a turn did, as one line")
+// ```
+pub fn describe_turn(t: WtTurn) -> Str []
+    todo("watch-nv.wtloop.describe_turn")

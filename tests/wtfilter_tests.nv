@@ -1,0 +1,152 @@
+// wtfilter_tests.nv — the descend decision, which is the expensive one.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: watch-nv.wtfilter.<fn>`.
+//
+// `may_descend` IS WHAT THE FILE IS FOR.  A filter that only decided
+// about events would place a watch on every directory in a repository —
+// two hundred thousand of them in one with a build directory nobody
+// excluded, against a stock limit of 8192 — and then throw the events
+// away.  The cases below are the ones that decide whether a whole
+// subtree is watched at all.
+
+use std.test
+use std.list
+use wtevent
+use wtfilter
+
+@test
+fn test_an_empty_include_list_means_everything() [io]
+    let f = wtfilter.everything()
+
+    test.case("which is the opposite of what the words suggest, and is what every tool does")
+    test.assert(wtfilter.admits(f, "src/main.nv", false))
+    test.assert(wtfilter.admits(f, "anything/at/all.txt", false))
+
+@test
+fn test_exclude_beats_include_whatever_the_order() [io]
+    let f = wtfilter.filter(["**/*.nv"], ["_novo/**"])
+
+    test.case("an included path is admitted")
+    test.assert(wtfilter.admits(f, "src/main.nv", false))
+
+    test.case("and an excluded one is not, even though it matches the include")
+    test.assert(wtfilter.admits(f, "_novo/main.nv", false) == false)
+
+@test
+fn test_a_path_matching_no_include_is_refused() [io]
+    let f = wtfilter.filter(["**/*.nv"], [])
+
+    test.case("a non-empty include list is a whitelist")
+    test.assert(wtfilter.admits(f, "README.md", false) == false)
+
+@test
+fn test_hidden_paths_are_skipped_by_default() [io]
+    let f = wtfilter.everything()
+
+    test.case("a dot directory at any depth")
+    test.assert(wtfilter.admits(f, ".git/HEAD", false) == false)
+    test.assert(wtfilter.admits(f, "src/.cache/x", false) == false)
+
+    test.case("and a caller can ask for them")
+    test.assert(wtfilter.admits(wtfilter.with_hidden(f), ".git/HEAD", false))
+
+@test
+fn test_an_excluded_directory_is_never_descended_into() [io]
+    let f = wtfilter.filter(["**/*.nv"], ["_novo/**"])
+
+    test.case("so no watch is placed anywhere beneath it")
+    test.assert(wtfilter.may_descend(f, "_novo") == false)
+
+    test.case("and one that could hold something interesting is descended")
+    test.assert(wtfilter.may_descend(f, "src"))
+
+@test
+fn test_the_descend_decision_is_conservative() [io]
+    let f = wtfilter.filter(["src/**/*.nv"], [])
+
+    test.case("a directory that might hold a match is descended")
+    test.assert(wtfilter.may_descend(f, "src"))
+
+    test.case("one the pattern cannot reach is not — which is the whole saving")
+    test.assert(wtfilter.may_descend(f, "docs") == false)
+
+    test.case("and the root is always descended, or nothing would be watched at all")
+    test.assert(wtfilter.may_descend(f, ""))
+
+@test
+fn test_metadata_events_are_skipped_by_default() [io]
+    let f = wtfilter.everything()
+    let meta = wtevent.event(WtMetadata, "src/main.nv", false, 0.0, 1)
+
+    test.case("so a chmod -R over a checkout does not rebuild everything")
+    test.assert(wtfilter.admits_event(f, meta) == false)
+
+    test.case("and a tool that cares can ask")
+    test.assert(wtfilter.admits_event(wtfilter.with_metadata(f), meta))
+
+@test
+fn test_either_end_of_a_rename_being_admitted_is_enough() [io]
+    let f = wtfilter.filter(["src/**"], [])
+    let out_of = wtevent.event(WtRenamed("src/a.nv", "docs/a.nv"), "docs/a.nv",
+                               false, 0.0, 1)
+
+    test.case("a file moved OUT of the watched set is a change to the watched set")
+    test.assert(wtfilter.admits_event(f, out_of))
+
+    test.case("and a rename entirely outside it is not")
+    test.assert(wtfilter.admits_event(f,
+        wtevent.event(WtRenamed("docs/a", "docs/b"), "docs/b", false, 0.0, 1)) == false)
+
+@test
+fn test_an_overflow_is_never_filtered_away() [io]
+    let f = wtfilter.filter(["src/**"], [])
+
+    test.case("because a consumer that is not told has already missed changes")
+    test.assert(wtfilter.admits_event(f, wtevent.event(WtOverflow(0), "", true, 0.0, 1)))
+
+@test
+fn test_a_batch_is_filtered_in_one_call() [io]
+    let f = wtfilter.filter(["**/*.nv"], [])
+    let batch = [wtevent.event(WtModified, "src/main.nv", false, 0.0, 1),
+                 wtevent.event(WtModified, "README.md", false, 0.0, 1)]
+
+    test.case("one of two survives")
+    test.assert(list.len(wtfilter.admitted(f, batch)) == 1)
+
+@test
+fn test_a_pattern_that_will_never_match_is_reported_at_startup() [io]
+    test.case("a good filter reports nothing")
+    test.assert(list.len(wtfilter.invalid_patterns(
+        wtfilter.filter(["**/*.nv"], ["_novo/**"]))) == 0)
+
+    test.case("and a broken pattern is named, rather than silently matching nothing")
+    test.assert(list.len(wtfilter.invalid_patterns(
+        wtfilter.filter(["[unclosed"], []))) == 1)
+
+@test
+fn test_the_common_excludes_cover_what_every_tool_wants_gone() [io]
+    let e = wtfilter.common_excludes()
+
+    test.case("there are some")
+    test.assert(list.len(e) > 0)
+
+    test.case("and a filter built from them excludes this project's own build directory")
+    test.assert(wtfilter.admits(wtfilter.filter([], e), "_novo/out.ll", false) == false)
+
+@test
+fn test_an_editor_artifact_is_recognised_before_it_causes_a_rebuild() [io]
+    test.case("vim's swap file")
+    test.assert(wtfilter.is_editor_artifact(".main.nv.swp"))
+
+    test.case("a backup tilde")
+    test.assert(wtfilter.is_editor_artifact("main.nv~"))
+
+    test.case("emacs's lock")
+    test.assert(wtfilter.is_editor_artifact(".#main.nv"))
+
+    test.case("vim's probe file, which is a bare number and surprises everybody")
+    test.assert(wtfilter.is_editor_artifact("4913"))
+
+    test.case("and the file a person is actually editing is not one")
+    test.assert(wtfilter.is_editor_artifact("main.nv") == false)

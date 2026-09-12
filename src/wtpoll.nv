@@ -1,0 +1,303 @@
+// wtpoll.nv — the backend that works everywhere, and what it costs.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// IT EXISTS BECAUSE inotify DOES NOT ALWAYS.  A network filesystem tells
+// the kernel nothing, a FUSE mount may not signal, a container may not
+// have the watches to spare, and every operating system that is not
+// Linux has a different mechanism.  A `--watch` mode that only worked
+// under inotify would be a `--watch` mode that silently did nothing on
+// exactly the setups where people most want it.
+//
+// A SNAPSHOT IS A VALUE AND COMPARING TWO IS `[]`.  `scan` reads the
+// tree, which is `[fs]`; `diff_snapshots` compares two, which is nothing
+// at all.  That is the split that makes this testable: a test builds two
+// snapshots from literals and asserts on the events, with no directory
+// anywhere, and every case that matters — a file whose size changed, one
+// whose mtime went BACKWARDS, one replaced within a second — is a
+// microsecond.
+//
+// THE COMPARISON IS `(size, mtime, mode)` AND NOT A HASH, for the same
+// reason git's index compares `stat` data: hashing a tree per interval
+// would read every byte of a repository every second.  The cost is a
+// change that keeps all three the same and is therefore invisible — a
+// file rewritten within the mtime's resolution with identical length —
+// and `rehash_suspicious` is the escape for a caller that cannot accept
+// that.
+//
+// AN mtime THAT WENT BACKWARDS IS A CHANGE.  A checkout, a restore from
+// a backup and an `rsync --times` all write files whose mtime is OLDER
+// than what was there, and a comparison written as `new > old` reports
+// nothing happened.  It is `!=`, and the case is asserted rather than
+// argued.
+//
+// THE INTERVAL IS THE CALLER'S and there is no thread here.  `scan`
+// answers when it has read the tree; `wtloop` decides when to call it
+// again.  A backend that slept inside itself would own the caller's
+// scheduling and could not be tested without waiting.
+
+use wtfilter
+
+// One path as a scan saw it.
+//
+// Three numbers and a flag, which is what a `stat` gives cheaply and
+// what a change reliably moves at least one of.
+pub struct WtStatEntry
+    path: Str
+    is_directory: Bool
+    size: Int
+    mtime_seconds: Int
+    mtime_nanos: Int
+    mode: Int
+
+// A whole tree as a scan saw it.
+//
+// Entries in path order, so comparing two is a merge rather than a
+// lookup per path — which on a tree of a hundred thousand files is the
+// difference between a comparison that finishes inside the poll interval
+// and one that does not.
+pub struct WtSnapshot
+    root: Str
+    entries: [WtStatEntry]
+    // When the scan ran, as the caller's clock reading, so the events a
+    // comparison produces can be stamped without reading it again.
+    at_unix: Float
+    // The scan stopped at `max_entries` and the snapshot is partial.  A
+    // comparison against a partial snapshot would report the unscanned
+    // remainder as deleted, so this is checked rather than assumed.
+    truncated: Bool
+
+// A polling backend over one root.
+pub struct WtPoller
+    root: Str
+    filter: WtFilter
+    max_depth: Int
+    max_entries: Int
+    // The slot holding the last snapshot, which the caller owns.
+    slot: Int
+
+// Reading directories costs `[fs]`, which is what the impl head
+// declares — and it is the honest difference from the inotify backend
+// beside it, which is `[io]` because a watch is a descriptor.
+impl WatchBackend[fs] for WtPoller
+    // Accept the watch.  A polling backend has one root and no per
+    // directory state, so this records the path and answers an id.
+    fn watch(self, path: Str) -> Result<Int, WtFault> [fs]
+        todo("watch-nv.wtpoll.WtPoller.watch")
+
+    // Forget a path.
+    fn unwatch(self, id: Int) -> Result<Unit, WtFault> [fs]
+        todo("watch-nv.wtpoll.WtPoller.unwatch")
+
+    // Scan, compare against the last snapshot, answer the differences.
+    //
+    // The deadline bounds the SCAN rather than a wait: a tree too large
+    // to read inside it answers what it read with `timed_out` false, so
+    // a caller that is being starved can see it.
+    fn poll(self, timeout_seconds: Float) -> Result<WtPoll, WtFault> [fs]
+        todo("watch-nv.wtpoll.WtPoller.poll")
+
+    // Drop the snapshot.
+    fn close(self) -> Result<Unit, WtFault> [fs]
+        todo("watch-nv.wtpoll.WtPoller.close")
+
+// A poller over this root, with this filter.
+//
+// ```novo
+// use wtfilter
+// use wtpoll
+//
+// fn main() [io]
+//     let p = wtpoll.poller(".", wtfilter.everything(), 0)
+//     println(p.root)
+// ```
+pub fn poller(root: Str, f: WtFilter, slot: Int) -> WtPoller []
+    todo("watch-nv.wtpoll.poller")
+
+// The same poller with a depth and an entry bound.
+//
+// Both exist because a poller with neither is a program that walks into
+// a symlink loop or reads a two-million-file tree every interval.
+//
+// ```novo
+// use wtfilter
+// use wtpoll
+//
+// fn main() [io]
+//     let p = wtpoll.bounded(wtpoll.poller(".", wtfilter.everything(), 0), 64, 200000)
+//     println("${p.max_depth}")
+// ```
+pub fn bounded(p: WtPoller, max_depth: Int, max_entries: Int) -> WtPoller []
+    todo("watch-nv.wtpoll.bounded")
+
+// Read the tree.
+//
+// `[fs]`, and `now_unix` is the caller's clock reading — so the scan
+// itself reads no clock and a test supplies one.
+//
+// Descends only where `wtfilter.may_descend` says to, which is the same
+// decision the inotify backend makes and for a sharper reason here: an
+// unfiltered scan of a repository with a build directory reads two
+// hundred thousand entries every interval.
+//
+// ```novo
+// use wtpoll
+//
+// fn look(p: WtPoller) -> Result<WtSnapshot, WtFault> [fs]
+//     wtpoll.scan(p, 1757548800.0)
+//
+// fn main() [io]
+//     println("a tree, as it is now")
+// ```
+pub fn scan(p: WtPoller, now_unix: Float) -> Result<WtSnapshot, WtFault> [fs]
+    todo("watch-nv.wtpoll.scan")
+
+// The events between two snapshots.
+//
+// `[]`, and it is the function this module's test suite spends its cases
+// on.  Both snapshots are in path order, so it is one merge.
+//
+// A path in the second and not the first is a create; in the first and
+// not the second, a remove; in both with any of size, mtime or mode
+// different, a modify — where a mode-only difference is `WtMetadata`, so
+// a caller filtering those gets what it asked for.
+//
+// A rename is NOT detected: polling cannot tell one from a delete and a
+// create, because nothing in a `stat` connects the two paths.  Said
+// here rather than approximated, because a heuristic that paired a
+// delete and a create by size would pair two unrelated empty files.
+//
+// ```novo
+// use wtpoll
+//
+// fn changed(a: WtSnapshot, b: WtSnapshot) -> [WtEvent]
+//     wtpoll.diff_snapshots(a, b)
+//
+// fn main() [io]
+//     println("what changed between two scans")
+// ```
+pub fn diff_snapshots(before: WtSnapshot, after: WtSnapshot) -> [WtEvent] []
+    todo("watch-nv.wtpoll.diff_snapshots")
+
+// An empty snapshot of this root.
+//
+// What a poller starts from, so the first scan reports everything as
+// created — which is correct and is what a `--watch` mode wants, because
+// it builds once at startup anyway.
+//
+// ```novo
+// use wtpoll
+//
+// fn main() [io]
+//     println("${list.len(wtpoll.empty_snapshot(".", 0.0).entries)}")
+// ```
+pub fn empty_snapshot(root: Str, at_unix: Float) -> WtSnapshot []
+    todo("watch-nv.wtpoll.empty_snapshot")
+
+// One entry, from the numbers a `stat` gave.
+//
+// Taking them rather than reading them, which is what keeps
+// `diff_snapshots` testable from literals.
+//
+// ```novo
+// use wtpoll
+//
+// fn main() [io]
+//     println(wtpoll.entry("src/main.nv", false, 42, 1757548800, 0, 33188).path)
+// ```
+pub fn entry(path: Str, is_directory: Bool, size: Int, mtime_seconds: Int, mtime_nanos: Int,
+             mode: Int) -> WtStatEntry []
+    todo("watch-nv.wtpoll.entry")
+
+// A snapshot from entries the caller has.
+//
+// Sorted here, so a caller building one from a walk of its own does not
+// have to know that the order is load-bearing.
+//
+// ```novo
+// use wtpoll
+//
+// fn main() [io]
+//     println("${wtpoll.snapshot(".", [], 0.0).truncated}")
+// ```
+pub fn snapshot(root: Str, entries: [WtStatEntry], at_unix: Float) -> WtSnapshot []
+    todo("watch-nv.wtpoll.snapshot")
+
+// Did these two entries change?
+//
+// Size, mtime or mode differing — with mtime compared for INEQUALITY
+// rather than for being newer, because a checkout, a restore and an
+// `rsync --times` all write files whose mtime goes backwards and a
+// comparison written as `new > old` reports that nothing happened.
+//
+// ```novo
+// use wtpoll
+//
+// fn moved(a: WtStatEntry, b: WtStatEntry) -> Bool
+//     wtpoll.entry_changed(a, b)
+//
+// fn main() [io]
+//     println("whether one path changed between scans")
+// ```
+pub fn entry_changed(before: WtStatEntry, after: WtStatEntry) -> Bool []
+    todo("watch-nv.wtpoll.entry_changed")
+
+// The paths a `stat` comparison cannot be sure about.
+//
+// An entry whose mtime is within one second of the snapshot's own time
+// and whose size did not change: a file rewritten inside the clock's
+// resolution with the same length is invisible to this backend, which is
+// the honest cost of not hashing.  A caller that cannot accept it reads
+// and compares exactly these.
+//
+// The same shape as git's racy-clean rule, and for the same reason.
+//
+// ```novo
+// use wtpoll
+//
+// fn unsure(a: WtSnapshot, b: WtSnapshot) -> [Str]
+//     wtpoll.rehash_suspicious(a, b)
+//
+// fn main() [io]
+//     println("the paths a stat comparison cannot settle")
+// ```
+pub fn rehash_suspicious(before: WtSnapshot, after: WtSnapshot) -> [Str] []
+    todo("watch-nv.wtpoll.rehash_suspicious")
+
+// How long the last scan of this many entries is likely to take, in
+// seconds.
+//
+// A rough figure from the entry count, published so a tool can refuse to
+// poll at 100 ms a tree that takes 400 ms to read — which is a program
+// that spends every cycle scanning and never reports anything, and which
+// looks from outside exactly like a program that is broken.
+//
+// ```novo
+// use wtpoll
+//
+// fn cost(entries: Int) -> Float
+//     wtpoll.estimated_scan_seconds(entries)
+//
+// fn main() [io]
+//     println("roughly how long a scan takes")
+// ```
+pub fn estimated_scan_seconds(entries: Int) -> Float []
+    todo("watch-nv.wtpoll.estimated_scan_seconds")
+
+// The smallest interval this tree can sensibly be polled at.
+//
+// `estimated_scan_seconds` with headroom.  A tool prints it when a
+// caller asks for something faster, rather than accepting the number and
+// silently never keeping up.
+//
+// ```novo
+// use wtpoll
+//
+// fn floor(entries: Int) -> Float
+//     wtpoll.minimum_interval(entries)
+//
+// fn main() [io]
+//     println("the fastest this tree can be polled")
+// ```
+pub fn minimum_interval(entries: Int) -> Float []
+    todo("watch-nv.wtpoll.minimum_interval")

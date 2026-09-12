@@ -1,0 +1,159 @@
+// wtdebounce_tests.nv — the timing, tested without waiting.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: watch-nv.wtdebounce.<fn>`.
+//
+// EVERY CASE HERE WOULD BE A SLEEP IN AN ORDINARY TEST SUITE, and none
+// of them is one: the clock is an argument, so a burst at 0.0, 0.01 and
+// 0.02 that should emit at 0.32 is three calls and an assertion.  That
+// is the whole argument for `[]` on this module, and it is worth more
+// than the purity itself — a debounce suite that sleeps is a suite
+// somebody eventually deletes for being slow.
+//
+// THE CAP IS THE CASE PEOPLE LEAVE OUT.  Without `max_seconds`, a
+// checkout that touches files continuously for thirty seconds never
+// reaches quiet and the tool never rebuilds — it sits there, and the
+// user concludes the watcher is broken.
+
+use std.test
+use std.list
+use wtevent
+use wtdebounce
+
+fn modified(path: Str) -> WtEvent
+    wtevent.event(WtModified, path, false, 0.0, 1)
+
+fn created(path: Str) -> WtEvent
+    wtevent.event(WtCreated, path, false, 0.0, 1)
+
+fn removed(path: Str) -> WtEvent
+    wtevent.event(WtRemoved, path, false, 0.0, 1)
+
+@test
+fn test_the_defaults_are_the_ones_a_person_does_not_notice() [io]
+    let d = wtdebounce.default_debounce()
+
+    test.case("300 milliseconds quiet: longer than any editor's save sequence")
+    test.assert(d.quiet_seconds == 0.3)
+
+    test.case("and three seconds at most, so a long checkout still reports")
+    test.assert(d.max_seconds == 3.0)
+
+@test
+fn test_an_event_waits_out_the_quiet_window() [io]
+    let (immediate, held) = wtdebounce.feed(wtdebounce.default_debounce(),
+                                            [modified("src/main.nv")], 0.0)
+
+    test.case("nothing comes out at once")
+    test.assert(list.len(immediate) == 0)
+    test.assert(wtdebounce.pending_count(held) == 1)
+
+    test.case("nor inside the window")
+    let (early, still) = wtdebounce.drain(held, 0.2)
+    test.assert(list.len(early) == 0)
+
+    test.case("and it comes out past it, with no sleep in this test")
+    let (late, empty) = wtdebounce.drain(still, 0.31)
+    test.assert(list.len(late) == 1)
+    test.assert(wtdebounce.pending_count(empty) == 0)
+
+@test
+fn test_a_burst_restarts_the_quiet_window() [io]
+    var d = wtdebounce.default_debounce()
+    let (_, a) = wtdebounce.feed(d, [modified("src/main.nv")], 0.0)
+    let (_, b) = wtdebounce.feed(a, [modified("src/main.nv")], 0.2)
+
+    test.case("the second event pushes the deadline out")
+    let (early, c) = wtdebounce.drain(b, 0.31)
+    test.assert(list.len(early) == 0)
+
+    test.case("and the one emission happens 300 ms after the LAST event")
+    let (late, _) = wtdebounce.drain(c, 0.51)
+    test.assert(list.len(late) == 1)
+
+@test
+fn test_the_cap_releases_a_burst_that_never_goes_quiet() [io]
+    var d = wtdebounce.debounce(0.3, 1.0)
+    let (_, a) = wtdebounce.feed(d, [modified("src/main.nv")], 0.0)
+    let (_, b) = wtdebounce.feed(a, [modified("src/main.nv")], 0.2)
+    let (_, c) = wtdebounce.feed(b, [modified("src/main.nv")], 0.4)
+    let (_, e) = wtdebounce.feed(c, [modified("src/main.nv")], 0.6)
+
+    test.case("the quiet window keeps being reset")
+    let (nothing, f) = wtdebounce.drain(e, 0.8)
+    test.assert(list.len(nothing) == 0)
+
+    test.case("and the cap fires anyway, a second after the FIRST event")
+    let (released, _) = wtdebounce.drain(f, 1.01)
+    test.assert(list.len(released) == 1)
+
+@test
+fn test_ten_events_for_one_path_become_one() [io]
+    var d = wtdebounce.default_debounce()
+    let (_, a) = wtdebounce.feed(d, [modified("src/main.nv"), modified("src/main.nv"),
+                                     modified("src/main.nv")],
+                                     0.0)
+
+    test.case("one pending path, not three")
+    test.assert(wtdebounce.pending_count(a) == 1)
+
+    test.case("and the count of what was folded is reportable")
+    match wtdebounce.pending_for(a, "src/main.nv")
+        Some(p) => test.assert(p.folded == 3)
+        None    => test.assert(false)
+
+@test
+fn test_two_paths_are_two_pending_entries() [io]
+    let (_, a) = wtdebounce.feed(wtdebounce.default_debounce(),
+                                 [modified("src/a.nv"), modified("src/b.nv")], 0.0)
+
+    test.case("coalescing is per path and not per batch")
+    test.assert(wtdebounce.pending_count(a) == 2)
+
+@test
+fn test_the_three_folding_rules() [io]
+    test.case("a create then a modify stays a CREATE — the consumer has never seen it")
+    test.assert(wtdebounce.fold(created("a"), modified("a")).kind == WtCreated)
+
+    test.case("anything then a remove is a REMOVE — the file is not there to read")
+    test.assert(wtdebounce.fold(modified("a"), removed("a")).kind == WtRemoved)
+
+    test.case("a remove then a create is a MODIFY — that is a save through a temp file")
+    test.assert(wtdebounce.fold(removed("a"), created("a")).kind == WtModified)
+
+@test
+fn test_an_overflow_bypasses_the_debouncer() [io]
+    let overflow = wtevent.event(WtOverflow(0), "", true, 0.0, 1)
+
+    test.case("it is marked as bypassing")
+    test.assert(wtdebounce.bypasses(overflow))
+
+    test.case("and it comes out of a feed at once, because a delay makes the loss worse")
+    let (out, _) = wtdebounce.feed(wtdebounce.default_debounce(), [overflow], 0.0)
+    test.assert(list.len(out) == 1)
+
+    test.case("while an ordinary event does not bypass")
+    test.assert(wtdebounce.bypasses(modified("a")) == false)
+
+@test
+fn test_the_next_deadline_is_what_turns_a_spin_into_a_sleep() [io]
+    test.case("an empty debouncer has nothing to wake for")
+    test.assert(wtdebounce.next_deadline(wtdebounce.default_debounce()) == None)
+
+    let (_, held) = wtdebounce.feed(wtdebounce.default_debounce(),
+                                    [modified("src/main.nv")], 1.0)
+
+    test.case("and one holding an event says when")
+    match wtdebounce.next_deadline(held)
+        Some(t) => test.assert(t == 1.3)
+        None    => test.assert(false)
+
+@test
+fn test_a_flush_releases_everything_whatever_the_windows_say() [io]
+    let (_, held) = wtdebounce.feed(wtdebounce.default_debounce(),
+                                    [modified("src/a.nv"), modified("src/b.nv")], 0.0)
+
+    test.case("both, at once, which is what a tool does on the way out")
+    let (out, empty) = wtdebounce.flush(held)
+    test.assert(list.len(out) == 2)
+    test.assert(wtdebounce.pending_count(empty) == 0)

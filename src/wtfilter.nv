@@ -1,0 +1,239 @@
+// wtfilter.nv — what to watch, decided before a watch is created rather
+// than after an event arrives.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE FILTER ANSWERS TWO DIFFERENT QUESTIONS AND ONLY ONE OF THEM IS
+// ABOUT EVENTS.  `admits` decides whether a path that changed is
+// interesting; `may_descend` decides whether to put a watch on a
+// directory at all — and the second is the one that matters.  inotify
+// watches ONE directory per descriptor, so a recursive watch over a
+// repository with a `target/` directory nobody excluded is two hundred
+// thousand file descriptors, which is past the per-user limit
+// (`/proc/sys/fs/user/max_inotify_watches`) on every machine.  A watcher
+// that filtered only the events would create every one of those watches
+// and then throw the events away.
+//
+// `glob.may_descend` is exactly that question and is why glob-nv is a
+// dependency rather than a string comparison: deciding that
+// `target/**/*.rs` cannot match anything under `src/` needs the pattern
+// parsed, not searched for a slash.
+//
+// EXCLUDE BEATS INCLUDE, AND IT IS STATED RATHER THAN DERIVED.  A
+// configuration with `include = ["**/*.nv"]` and
+// `exclude = ["_novo/**"]` means the obvious thing, and a filter that
+// applied them in list order would depend on which the caller wrote
+// first.  The one rule, once, in `admits`.
+//
+// AN EMPTY INCLUDE LIST MEANS EVERYTHING, which is the opposite of what
+// "an empty list of things to include" suggests and is what every tool
+// with such a flag does — because the flag's absence must not mean
+// "watch nothing".
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+use glob
+
+// What a watch will and will not report.
+//
+// Patterns are glob-nv's, matched against paths RELATIVE to the watch
+// root — which is why `WtEvent.path` is relative too, and why a filter
+// written against one root works against another.
+pub struct WtFilter
+    // Empty means everything.
+    include: [Str]
+    exclude: [Str]
+    // Ignore a path whose name begins with a dot, at any depth.  A
+    // separate flag rather than an exclude pattern because `.git` and
+    // `.novo-lock` are the two the caller always wants gone and writing
+    // them as patterns in every configuration is how one gets forgotten.
+    skip_hidden: Bool
+    // Ignore `WtMetadata` events.  On by default: a build tool does not
+    // care that a file's mode changed, and `chmod -R` over a checkout
+    // would otherwise rebuild everything.
+    skip_metadata: Bool
+
+// A filter that admits everything.
+//
+// ```novo
+// use wtfilter
+//
+// fn main() [io]
+//     println("${list.len(wtfilter.everything().include)}")
+// ```
+pub fn everything() -> WtFilter []
+    todo("watch-nv.wtfilter.everything")
+
+// A filter over these include and exclude patterns, skipping hidden
+// paths and metadata events.
+//
+// The one a tool builds from its flags.
+//
+// ```novo
+// use wtfilter
+//
+// fn main() [io]
+//     let f = wtfilter.filter(["**/*.nv"], ["_novo/**"])
+//     println("${list.len(f.exclude)}")
+// ```
+pub fn filter(include: [Str], exclude: [Str]) -> WtFilter []
+    todo("watch-nv.wtfilter.filter")
+
+// The same filter, reporting metadata changes too.
+//
+// For a tool that cares — a permissions auditor, a backup.
+//
+// ```novo
+// use wtfilter
+//
+// fn main() [io]
+//     println("${wtfilter.with_metadata(wtfilter.everything()).skip_metadata}")
+// ```
+pub fn with_metadata(f: WtFilter) -> WtFilter []
+    todo("watch-nv.wtfilter.with_metadata")
+
+// The same filter, reporting hidden paths too.
+//
+// ```novo
+// use wtfilter
+//
+// fn main() [io]
+//     println("${wtfilter.with_hidden(wtfilter.everything()).skip_hidden}")
+// ```
+pub fn with_hidden(f: WtFilter) -> WtFilter []
+    todo("watch-nv.wtfilter.with_hidden")
+
+// Would this filter report a change to this path?
+//
+// Exclude beats include; an empty include list admits everything; a
+// hidden component anywhere in the path is excluded when `skip_hidden`
+// is on.
+//
+// ```novo
+// use wtfilter
+//
+// fn main() [io]
+//     let f = wtfilter.filter(["**/*.nv"], ["_novo/**"])
+//     println("${wtfilter.admits(f, "src/main.nv", false)}")
+// ```
+pub fn admits(f: WtFilter, path: Str, is_directory: Bool) -> Bool []
+    todo("watch-nv.wtfilter.admits")
+
+// Would this filter report this event?
+//
+// `admits` over the event's paths, plus the metadata rule — and for a
+// rename, EITHER end being admitted is enough, because a file moved out
+// of the watched set is a change to the watched set.
+//
+// ```novo
+// use wtevent
+// use wtfilter
+//
+// fn wanted(f: WtFilter, e: WtEvent) -> Bool
+//     wtfilter.admits_event(f, e)
+//
+// fn main() [io]
+//     println("whether a filter reports an event")
+// ```
+pub fn admits_event(f: WtFilter, e: WtEvent) -> Bool []
+    todo("watch-nv.wtfilter.admits_event")
+
+// Is any admitted path possibly under this directory?
+//
+// THE CALL THAT DECIDES WHETHER A WATCH IS CREATED, and the difference
+// between twenty watches and two hundred thousand.  `false` means the
+// directory is not descended into and no watch is placed anywhere
+// beneath it.
+//
+// It is CONSERVATIVE on purpose: a `true` answer for a directory that
+// turns out to hold nothing interesting costs one wasted watch, and a
+// `false` answer for one that did costs a change nobody is told about.
+//
+// ```novo
+// use wtfilter
+//
+// fn main() [io]
+//     let f = wtfilter.filter(["src/**/*.nv"], ["_novo/**"])
+//     println("${wtfilter.may_descend(f, "_novo")}")
+// ```
+pub fn may_descend(f: WtFilter, directory: Str) -> Bool []
+    todo("watch-nv.wtfilter.may_descend")
+
+// Every event in this batch the filter admits.
+//
+// One call rather than a filter at every call site, because the batch is
+// what a backend answers and filtering it is what every consumer does
+// first.
+//
+// ```novo
+// use wtevent
+// use wtfilter
+//
+// fn wanted(f: WtFilter, es: [WtEvent]) -> [WtEvent]
+//     wtfilter.admitted(f, es)
+//
+// fn main() [io]
+//     println("the events worth reporting")
+// ```
+pub fn admitted(f: WtFilter, events: [WtEvent]) -> [WtEvent] []
+    todo("watch-nv.wtfilter.admitted")
+
+// Is every pattern in this filter one glob-nv accepts?
+//
+// Answers the patterns that are not, so a tool can report a bad
+// `--watch-exclude` flag at startup rather than watching everything and
+// wondering why.  A pattern that does not parse would otherwise match
+// nothing, silently.
+//
+// ```novo
+// use wtfilter
+//
+// fn bad(f: WtFilter) -> [Str]
+//     wtfilter.invalid_patterns(f)
+//
+// fn main() [io]
+//     println("the patterns that will never match anything")
+// ```
+pub fn invalid_patterns(f: WtFilter) -> [Str] []
+    todo("watch-nv.wtfilter.invalid_patterns")
+
+// The exclude patterns every tool in this project wants.
+//
+// `_novo/**`, `.git/**`, `target/**`, `node_modules/**`, and the editor
+// swap files whose creation and deletion is otherwise a rebuild per
+// keystroke — `*.swp`, `*~`, `.#*`, `4913`, which is the number vim
+// names its probe file.
+//
+// Published as data rather than baked in, because a tool that hard-coded
+// them could not watch a repository whose build directory it genuinely
+// wanted to watch.
+//
+// ```novo
+// use wtfilter
+//
+// fn main() [io]
+//     println("${list.len(wtfilter.common_excludes()) > 0}")
+// ```
+pub fn common_excludes() -> [Str] []
+    todo("watch-nv.wtfilter.common_excludes")
+
+// Is this path one an editor made and will remove in a moment?
+//
+// The swap-file test on its own, because the failure is specific: an
+// editor saving one file creates a temporary, writes it, renames it over
+// the target and deletes a lock — four to six events for one logical
+// save — and a tool that treated each as a change rebuilds four times
+// per keystroke in some editors.
+//
+// `wtdebounce` handles the timing half; this handles the "that file was
+// never interesting" half, and the two together are what makes a
+// `--watch` mode usable.
+//
+// ```novo
+// use wtfilter
+//
+// fn main() [io]
+//     println("${wtfilter.is_editor_artifact(".main.nv.swp")}")
+// ```
+pub fn is_editor_artifact(path: Str) -> Bool []
+    todo("watch-nv.wtfilter.is_editor_artifact")

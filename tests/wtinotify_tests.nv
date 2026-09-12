@@ -1,0 +1,102 @@
+// wtinotify_tests.nv — the limits, which are the support questions.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: watch-nv.wtinotify.<fn>`.
+//
+// THE `fits` AND `raise_limit_hint` CASES ARE THE FILE'S POINT.  Every
+// person who has run a file watcher on a large repository has met "too
+// many open files" or a watcher that silently stopped noticing changes,
+// and the fix is one `sysctl` line nobody remembers.  A tool that counts
+// what it is about to watch, compares it here, and prints that line has
+// solved the problem; one that walks until the kernel refuses has
+// already placed eight thousand watches it now has to unwind.
+//
+// The backend itself is `[io]` and is not exercised — a suite that
+// opened an inotify instance would be testing the kernel — so the
+// signatures are named with the rows they declare and the arithmetic is
+// where the assertions are.
+
+use std.test
+use std.list
+use std.str
+use wtinotify
+use wtwatch
+
+@test
+fn test_the_stock_limits_are_the_numbers_an_operator_meets() [io]
+    let l = wtinotify.default_limits()
+
+    test.case("8192 watches, which a repository of ten thousand directories passes")
+    test.assert(l.max_user_watches == 8192)
+
+    test.case("128 instances")
+    test.assert(l.max_user_instances == 128)
+
+    test.case("and a queue of 16384, past which the kernel drops events")
+    test.assert(l.max_queued_events == 16384)
+
+@test
+fn test_fits_is_asked_before_the_walk_rather_than_after_the_refusal() [io]
+    let l = wtinotify.default_limits()
+
+    test.case("a small tree fits")
+    test.assert(wtinotify.fits(l, 200))
+
+    test.case("a repository with a build directory nobody excluded does not")
+    test.assert(wtinotify.fits(l, 200000) == false)
+
+    test.case("and exactly the limit fits, because the limit is a maximum")
+    test.assert(wtinotify.fits(l, 8192))
+
+@test
+fn test_the_hint_is_the_line_a_person_needs_and_nobody_remembers() [io]
+    let hint = wtinotify.raise_limit_hint(524288)
+
+    test.case("it names the sysctl")
+    test.assert(str.contains(hint, "max_user_watches"))
+
+    test.case("and the number, so it can be pasted")
+    test.assert(str.contains(hint, "524288"))
+
+@test
+fn test_the_blind_spots_are_data_a_tool_can_print() [io]
+    let spots = wtinotify.known_blind_spots()
+
+    test.case("there are some, and they are sentences rather than codes")
+    test.assert(list.len(spots) == 3)
+    test.assert(spots[0] != "")
+
+@test
+fn test_the_watch_limit_fault_carries_the_number() [io]
+    test.case("because 'too many watches' without it is not actionable")
+    test.assert(WtWatchLimit(8192).message() != "")
+
+    test.case("and the two limits are two different remedies")
+    test.assert(WtWatchLimit(8192).message() != WtInstanceLimit(128).message())
+
+@test
+fn test_an_unsupported_filesystem_is_the_one_that_means_use_polling() [io]
+    test.case("a network mount tells the kernel nothing")
+    test.assert(wtwatch.suggests_polling(WtUnsupportedFilesystem("/mnt/nfs")))
+
+// The backend's own surface, named with the rows it declares.  `[io]`
+// for everything that touches the descriptor, and `[fs]` for the one
+// call that genuinely reads three files under `/proc` — which is the
+// honest split and not a tidy one.
+fn start() -> Result<WtInotify, WtFault> [io]
+    wtinotify.open()
+
+fn start_with(n: Int) -> Result<WtInotify, WtFault> [io]
+    wtinotify.open_with(n)
+
+fn here() -> Bool [io]
+    wtinotify.is_available()
+
+fn kernel_limits() -> Result<WtInotifyLimits, WtFault> [fs]
+    wtinotify.limits_from_proc()
+
+fn buffer(w: WtInotify) -> Int
+    wtinotify.buffer_size(w)
+
+fn held(w: WtInotify) -> Int
+    wtinotify.watches_held(w)

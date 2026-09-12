@@ -1,0 +1,243 @@
+// wtdebounce.nv — turning a burst of events into the one change that
+// happened.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// ONE SAVE IS FOUR TO SIX EVENTS, and that is the whole problem.  An
+// editor writing `main.nv` creates `main.nv~` or `.main.nv.swp`, writes
+// it, renames it over `main.nv`, and removes the lock — so a tool that
+// rebuilt per event rebuilds four times for one keystroke's worth of
+// intent, and the second rebuild starts while the first is reading a
+// file the third is about to replace.
+//
+// A DEBOUNCER IS A VALUE AND THE CLOCK IS AN ARGUMENT.  Every row here
+// is `[]`: `feed` takes the events and the caller's clock reading and
+// answers what is ready, `next_deadline` says when to look again, and
+// nothing sleeps.  That is what makes the whole coalescing policy
+// testable in microseconds — a test feeds events at 0.0, 0.01 and 0.02
+// and asserts what comes out at 0.3, with no sleep anywhere — and it is
+// what lets the same debouncer sit in a poll loop, an async runtime or a
+// single-threaded tool, because none of them has to give up its own
+// scheduling.
+//
+// TWO WINDOWS, NOT ONE, and the second is the one people leave out.
+// `quiet_seconds` is the ordinary debounce: emit once the burst stops.
+// `max_seconds` is the cap: emit anyway once the FIRST event of the
+// burst is that old.  Without the cap, a `cargo build` or a `git
+// checkout` that touches files continuously for thirty seconds never
+// reaches quiet and the tool never rebuilds — it just sits there, and
+// the user concludes the watcher is broken.
+//
+// COALESCING IS PER PATH AND IT KEEPS THE INTERESTING ONE.  Ten
+// `WtModified` events for one path become one; a `WtCreated` followed by
+// `WtModified` stays a create, because a consumer that is told "modified"
+// about a file it has never seen has to stat it to find out; and
+// anything followed by `WtRemoved` becomes a remove, because the file is
+// not there and reporting the earlier write sends a build to read it.
+
+use wtevent
+
+// How long to wait, and how long to wait at most.
+pub struct WtDebounce
+    // Emit a path's event once nothing has touched it for this long.
+    quiet_seconds: Float
+    // Emit anyway once the first event for that path is this old, so a
+    // continuous burst does not starve the consumer forever.
+    max_seconds: Float
+    // What is waiting, per path.
+    pending: [WtPending]
+
+// One path's coalesced state.
+pub struct WtPending
+    path: Str
+    // The event that will be emitted, after coalescing.
+    event: WtEvent
+    // When the first event for this path arrived, which `max_seconds`
+    // is measured from.
+    first_unix: Float
+    // When the most recent one arrived, which `quiet_seconds` is
+    // measured from.
+    last_unix: Float
+    // How many raw events were folded into it.  Reported so a tool can
+    // say "rebuilt after 6 events" rather than leaving a person to
+    // wonder whether the watcher saw anything.
+    folded: Int
+
+// A debouncer with these two windows.
+//
+// ```novo
+// use wtdebounce
+//
+// fn main() [io]
+//     println("${wtdebounce.debounce(0.3, 3.0).quiet_seconds}")
+// ```
+pub fn debounce(quiet_seconds: Float, max_seconds: Float) -> WtDebounce []
+    todo("watch-nv.wtdebounce.debounce")
+
+// The defaults: 300 milliseconds quiet, 3 seconds at most.
+//
+// 300 ms is longer than any editor's save sequence and shorter than a
+// person notices; 3 seconds is short enough that a long checkout still
+// produces feedback while it runs.
+//
+// ```novo
+// use wtdebounce
+//
+// fn main() [io]
+//     println("${wtdebounce.default_debounce().max_seconds}")
+// ```
+pub fn default_debounce() -> WtDebounce []
+    todo("watch-nv.wtdebounce.default_debounce")
+
+// Feed a batch and drain whatever is ready.
+//
+// `[]`, and `now_unix` is the caller's clock reading — one per batch,
+// not one per event.  What comes out is the events whose quiet window
+// has passed or whose cap has been reached; everything else stays in the
+// debouncer.
+//
+// An event that `wtevent.demands_rescan` is true of is NOT debounced: it
+// comes straight out, because an overflow means the consumer is already
+// missing changes and delaying the notice makes that worse.
+//
+// ```novo
+// use wtdebounce
+// use wtevent
+//
+// fn settle(d: WtDebounce, es: [WtEvent]) -> ([WtEvent], WtDebounce)
+//     wtdebounce.feed(d, es, 1757548800.0)
+//
+// fn main() [io]
+//     println("a burst of events, settled")
+// ```
+pub fn feed(d: WtDebounce, events: [WtEvent], now_unix: Float) -> ([WtEvent], WtDebounce) []
+    todo("watch-nv.wtdebounce.feed")
+
+// Drain whatever is ready without feeding anything.
+//
+// What an idle loop calls: a burst that stopped produces nothing more to
+// feed, so a debouncer that only drained on input would hold the last
+// save until the next one.  Which in a tool a person is waiting on is
+// exactly the case that matters.
+//
+// ```novo
+// use wtdebounce
+//
+// fn settle(d: WtDebounce) -> ([WtEvent], WtDebounce)
+//     wtdebounce.drain(d, 1757548801.0)
+//
+// fn main() [io]
+//     println("what is ready now")
+// ```
+pub fn drain(d: WtDebounce, now_unix: Float) -> ([WtEvent], WtDebounce) []
+    todo("watch-nv.wtdebounce.drain")
+
+// When the caller should look again, or `None` when nothing is waiting.
+//
+// `[]`, and it is what turns a poll loop into a sleep: a loop that woke
+// every 10 ms to ask a debouncer whether anything was ready burns a core
+// doing nothing, and one that slept until this instant burns none.
+//
+// ```novo
+// use wtdebounce
+//
+// fn when(d: WtDebounce) -> Float
+//     match wtdebounce.next_deadline(d)
+//         Some(t) => t
+//         None    => 0.0
+//
+// fn main() [io]
+//     println("when to wake up next")
+// ```
+pub fn next_deadline(d: WtDebounce) -> ?Float []
+    todo("watch-nv.wtdebounce.next_deadline")
+
+// Everything waiting, emitted now, whatever the windows say.
+//
+// What a tool calls on the way out, and what a `--watch` mode's
+// "rebuild now" key does.
+//
+// ```novo
+// use wtdebounce
+//
+// fn now(d: WtDebounce) -> ([WtEvent], WtDebounce)
+//     wtdebounce.flush(d)
+//
+// fn main() [io]
+//     println("everything waiting, released")
+// ```
+pub fn flush(d: WtDebounce) -> ([WtEvent], WtDebounce) []
+    todo("watch-nv.wtdebounce.flush")
+
+// How many paths are waiting.
+//
+// ```novo
+// use wtdebounce
+//
+// fn main() [io]
+//     println("${wtdebounce.pending_count(wtdebounce.default_debounce())}")
+// ```
+pub fn pending_count(d: WtDebounce) -> Int []
+    todo("watch-nv.wtdebounce.pending_count")
+
+// What is waiting for this path, if anything.
+//
+// Published because `folded` is on it, and "six events became one" is
+// the line a `--watch` mode prints that makes a person trust it.
+//
+// ```novo
+// use wtdebounce
+//
+// fn waiting(d: WtDebounce) -> ?WtPending
+//     wtdebounce.pending_for(d, "src/main.nv")
+//
+// fn main() [io]
+//     println("what is waiting for one path")
+// ```
+pub fn pending_for(d: WtDebounce, path: Str) -> ?WtPending []
+    todo("watch-nv.wtdebounce.pending_for")
+
+// Fold two events for one path into the one a consumer should be told
+// about.
+//
+// The coalescing rule on its own, `[]`, because it is the part with
+// three cases that each look arbitrary until they are beside each other:
+//
+// - a create then a modify is a CREATE, because a consumer told
+//   "modified" about a file it has never seen has to go and look;
+// - anything then a remove is a REMOVE, because the file is not there
+//   and reporting the write sends a build to read it;
+// - a remove then a create is a MODIFY, because that is what a
+//   rename-over-the-target save looks like from outside and reporting a
+//   delete would make a consumer drop state it is about to need.
+//
+// ```novo
+// use wtdebounce
+// use wtevent
+//
+// fn one(a: WtEvent, b: WtEvent) -> WtEvent
+//     wtdebounce.fold(a, b)
+//
+// fn main() [io]
+//     println("two events for one path, as one")
+// ```
+pub fn fold(earlier: WtEvent, later: WtEvent) -> WtEvent []
+    todo("watch-nv.wtdebounce.fold")
+
+// Would this event bypass the debouncer?
+//
+// An overflow or a lost watch, which come straight out.  Published so a
+// caller can see the rule rather than discovering it from a timing test.
+//
+// ```novo
+// use wtdebounce
+// use wtevent
+//
+// fn straight(e: WtEvent) -> Bool
+//     wtdebounce.bypasses(e)
+//
+// fn main() [io]
+//     println("whether an event skips the debounce")
+// ```
+pub fn bypasses(e: WtEvent) -> Bool []
+    todo("watch-nv.wtdebounce.bypasses")

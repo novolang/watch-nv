@@ -1,0 +1,308 @@
+// wtwatch.nv — the one interface both backends are behind.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `WatchBackend[e]` IS THE LOAD-BEARING INTERFACE, and the effect
+// parameter is what makes it worth having.  The inotify backend costs
+// `[io]` because a watch is a file descriptor; the polling backend costs
+// `[fs]` because it reads directories; a recorded backend replaying a
+// transcript in a test costs NOTHING.  So `wtloop.run_on_change` — the
+// whole of a `--watch` mode — is written once against the trait and
+// charged exactly what the caller's backend costs, and a test of a
+// tool's watch loop runs at `[]` with no filesystem and no clock.
+//
+// An enum of backends would charge every caller the union, `[io, fs]`,
+// including the test.
+//
+// `poll` NEVER BLOCKS, AND THAT IS THE CONTRACT.  It takes a deadline
+// and answers what it has when the deadline passes — so a caller that
+// also has a socket, a signal or a key to attend to keeps its own
+// scheduling, and a caller with nothing else to do passes a long
+// deadline and gets the same behaviour as a blocking read.  A backend
+// with a blocking `next_event` would make every tool that watches files
+// AND does something else grow a thread.
+//
+// A WATCH IS A HANDLE AND THE TREE IS THE CALLER'S.  `watch` places one
+// watch on one directory and answers an id; recursion is `wtloop`'s,
+// built out of `watch` plus the `WtCreated`-on-a-directory events the
+// backend reports.  That is not a convenience left out: on Linux
+// recursion is not a kernel feature, and a backend that pretended
+// otherwise would hide the window between a `mkdir` and the watch
+// landing on it — which is a real gap in which events are lost, and
+// which a caller can only handle if it knows it exists.
+
+use wtevent
+use wtfilter
+
+// Why a watch could not be placed or read.
+//
+// Each arm is a real thing an operator meets, and they are separate
+// because the remedies differ: a limit wants a `sysctl`, a permission
+// wants a different user, and an unwatchable filesystem wants the
+// polling backend.
+pub enum WtFault
+    // The path is not there.
+    WtNotFound(path: Str)
+    // The process may not watch it.
+    WtPermissionDenied(path: Str)
+    // The per-user watch limit is reached.  `limit` is what the kernel
+    // said, because "raise `fs.inotify.max_user_watches`" is only
+    // actionable next to the number it is at — and the number is why
+    // `wtfilter.may_descend` exists.
+    WtWatchLimit(limit: Int)
+    // The per-user instance limit is reached: too many watchers in one
+    // process or one user.
+    WtInstanceLimit(limit: Int)
+    // The filesystem does not support this backend — a network mount,
+    // an overlay, a FUSE filesystem that does not signal.  The one
+    // fault whose remedy is `wtpoll` rather than a configuration
+    // change, and the reason the polling backend exists.
+    WtUnsupportedFilesystem(path: Str)
+    // The backend was closed.
+    WtClosed
+    // The transport failed for a reason the backend cannot classify.
+    WtBackendFailed(detail: Str)
+
+// The standard `Error` implementation.
+impl Error for WtFault
+    // One line: what could not be watched, and what to do about it.
+    //
+    // A limit names the number, because "too many watches" without one
+    // sends a person to a search engine and "at 8192 watches" sends
+    // them to a `sysctl`.
+    fn message(self) -> Str
+        todo("watch-nv.wtwatch.WtFault.message")
+
+// One placed watch.
+pub struct WtWatch
+    id: Int
+    // The directory, relative to the root the watcher was created on.
+    path: Str
+    recursive_root: Bool
+
+// What a `poll` returned.
+//
+// A struct rather than a list, because the two facts a loop needs — the
+// events, and whether the deadline was what ended the call — cannot be
+// distinguished by an empty list: "nothing happened" and "the backend
+// stopped" look identical, and a loop that could not tell spins.
+pub struct WtPoll
+    events: [WtRawEvent]
+    // The deadline passed with nothing more to read.  `false` means
+    // there may be more immediately available, so a loop calls again
+    // before it sleeps.
+    timed_out: Bool
+    // The backend dropped events since the last poll.  Reported here as
+    // well as in the stream, because a caller that filters the events
+    // could filter the overflow away.
+    overflowed: Bool
+
+// Where events come from.
+//
+// The trait binds one effect parameter, `e`, and every member uses it
+// (SPEC § 5.6 requires both).  An impl supplies the set its own
+// implementation actually costs: `impl WatchBackend[io]` for inotify,
+// `impl WatchBackend[fs]` for polling, and `impl WatchBackend[]` for a
+// recorded transcript.
+pub trait WatchBackend[e]
+    // Place a watch on one directory and answer its id.
+    //
+    // One directory, not a tree: see the module note.
+    fn watch(self, path: Str) -> Result<Int, WtFault> [e]
+    // Remove a watch.  Removing one that is already gone is not a
+    // failure, because a watch on a deleted directory is removed by the
+    // kernel and a caller racing that should not have to care.
+    fn unwatch(self, id: Int) -> Result<Unit, WtFault> [e]
+    // Take what is available, waiting at most this long.
+    //
+    // Never blocks past the deadline.  A deadline of `0.0` is a
+    // non-blocking take.
+    fn poll(self, timeout_seconds: Float) -> Result<WtPoll, WtFault> [e]
+    // Stop, and release every watch.
+    fn close(self) -> Result<Unit, WtFault> [e]
+
+// A backend that replays a transcript.
+//
+// `impl WatchBackend[]`, and it is what a test of a tool's watch loop
+// uses: the tool's own code runs unchanged, the events are the ones the
+// test wrote, and the whole loop is charged nothing.
+//
+// `slot` names a cell the caller owns holding the remaining events;
+// `at` is how far the replay has got, so a test can assert the loop
+// consumed what it should.
+pub struct WtReplayBackend
+    slot: Int
+    at: Int
+
+// Replaying a transcript performs nothing, which is what `[]` in the
+// impl head says and what the effect checker holds it to.
+impl WatchBackend[] for WtReplayBackend
+    // Accept the watch and answer an id; nothing is placed anywhere.
+    fn watch(self, path: Str) -> Result<Int, WtFault> []
+        todo("watch-nv.wtwatch.WtReplayBackend.watch")
+
+    // Accept the removal.
+    fn unwatch(self, id: Int) -> Result<Unit, WtFault> []
+        todo("watch-nv.wtwatch.WtReplayBackend.unwatch")
+
+    // Answer the next slice of the transcript.  The deadline is
+    // ignored, so a test runs at whatever speed it runs.
+    fn poll(self, timeout_seconds: Float) -> Result<WtPoll, WtFault> []
+        todo("watch-nv.wtwatch.WtReplayBackend.poll")
+
+    // Stop.
+    fn close(self) -> Result<Unit, WtFault> []
+        todo("watch-nv.wtwatch.WtReplayBackend.close")
+
+// A replay backend over a slot the caller filled.
+//
+// ```novo
+// use wtwatch
+//
+// fn main() [io]
+//     println("${wtwatch.replay_backend(0).at}")
+// ```
+pub fn replay_backend(slot: Int) -> WtReplayBackend []
+    todo("watch-nv.wtwatch.replay_backend")
+
+// A poll result with nothing in it.
+//
+// What an idle backend answers, and what a test compares against.
+//
+// ```novo
+// use wtwatch
+//
+// fn main() [io]
+//     println("${wtwatch.idle_poll().timed_out}")
+// ```
+pub fn idle_poll() -> WtPoll []
+    todo("watch-nv.wtwatch.idle_poll")
+
+// Place watches on a whole tree, answering the ones placed.
+//
+// THE ROW IS `[e]`: the recursion is written once and charged what the
+// caller's own backend costs.  It descends only where
+// `wtfilter.may_descend` says to, which is what keeps a repository with
+// an excluded build directory at twenty watches rather than two hundred
+// thousand.
+//
+// A directory that could not be watched does not stop the walk: the
+// faults come back beside the watches, because one unreadable directory
+// in a large tree must not cost a tool the rest of it.
+//
+// ```novo
+// use wtfilter
+// use wtwatch
+//
+// fn place<B: wtwatch.WatchBackend[e]>(b: B, f: WtFilter) -> WtWatchTree [e]
+//     wtwatch.watch_tree(b, ".", f, 64)
+//
+// fn main() [io]
+//     println("a tree, watched, charged what the backend costs")
+// ```
+pub fn watch_tree<B: WatchBackend[e]>(b: B, root: Str, f: WtFilter,
+                                      max_depth: Int) -> WtWatchTree [e]
+    todo("watch-nv.wtwatch.watch_tree")
+
+// What watching a tree produced.
+//
+// The watches AND the faults, because a walk that refused on the first
+// unreadable directory would be unusable on any real machine, and one
+// that silently skipped them would leave a tool blind in a subtree
+// nobody could see was unwatched.
+pub struct WtWatchTree
+    watches: [WtWatch]
+    faults: [WtFault]
+    // Directories the filter said not to descend into.  Reported so a
+    // tool can print what it is not watching, which is the answer to
+    // "why did my change not trigger a rebuild".
+    skipped: [Str]
+
+// Remove every watch in this tree.
+//
+// ```novo
+// use wtwatch
+//
+// fn drop_all<B: wtwatch.WatchBackend[e]>(b: B, t: WtWatchTree) -> [WtFault] [e]
+//     wtwatch.unwatch_tree(b, t)
+//
+// fn main() [io]
+//     println("a tree, unwatched")
+// ```
+pub fn unwatch_tree<B: WatchBackend[e]>(b: B, t: WtWatchTree) -> [WtFault] [e]
+    todo("watch-nv.wtwatch.unwatch_tree")
+
+// Place a watch on a directory that has just appeared.
+//
+// The other half of recursion: a `WtCreated` event on a directory means
+// a subtree exists that has no watches on it, and a watcher that did not
+// add them misses everything that happens inside it for the rest of the
+// run.
+//
+// It re-walks the new directory, because between the `mkdir` and this
+// call the tree may already have grown — which is the window the module
+// note names and the reason a caller should also handle
+// `wtevent.demands_rescan`.
+//
+// ```novo
+// use wtfilter
+// use wtwatch
+//
+// fn grow<B: wtwatch.WatchBackend[e]>(b: B, t: WtWatchTree, f: WtFilter) -> WtWatchTree [e]
+//     wtwatch.watch_new_directory(b, t, "src/new", f, 64)
+//
+// fn main() [io]
+//     println("a new directory, watched")
+// ```
+pub fn watch_new_directory<B: WatchBackend[e]>(b: B, t: WtWatchTree, path: Str, f: WtFilter,
+                                               max_depth: Int) -> WtWatchTree [e]
+    todo("watch-nv.wtwatch.watch_new_directory")
+
+// The watch with this id, if the tree has one.
+//
+// ```novo
+// use wtwatch
+//
+// fn which(t: WtWatchTree) -> ?WtWatch
+//     wtwatch.watch_of(t, 1)
+//
+// fn main() [io]
+//     println("one watch out of a tree")
+// ```
+pub fn watch_of(t: WtWatchTree, id: Int) -> ?WtWatch []
+    todo("watch-nv.wtwatch.watch_of")
+
+// How many watches this tree holds.
+//
+// Published because it is the number a tool prints at startup and the
+// number an operator compares against `fs.inotify.max_user_watches`
+// when a watcher stops working on a big repository.
+//
+// ```novo
+// use wtwatch
+//
+// fn main() [io]
+//     println("the watches a tree is holding")
+// ```
+pub fn watch_count(t: WtWatchTree) -> Int []
+    todo("watch-nv.wtwatch.watch_count")
+
+// Is this fault one the polling backend would not have?
+//
+// `WtUnsupportedFilesystem`, `WtWatchLimit` and `WtInstanceLimit` — the
+// three that are about inotify rather than about the directory.
+// Published because "fall back to polling" is a decision a tool makes
+// once, at startup, and making it on the wrong fault means polling a
+// directory that does not exist.
+//
+// ```novo
+// use wtwatch
+//
+// fn fall_back(f: WtFault) -> Bool
+//     wtwatch.suggests_polling(f)
+//
+// fn main() [io]
+//     println("whether to fall back to polling")
+// ```
+pub fn suggests_polling(f: WtFault) -> Bool []
+    todo("watch-nv.wtwatch.suggests_polling")

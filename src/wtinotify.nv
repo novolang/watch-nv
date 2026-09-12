@@ -1,0 +1,263 @@
+// wtinotify.nv — the Linux backend, and the four limits an operator
+// meets.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[io]` AND NOT `[fs]`.  An inotify watcher is a file descriptor: the
+// instance comes from `inotify_init1`, a watch from `inotify_add_watch`,
+// and events from `read` on the descriptor.  Nothing here opens a file
+// or reads a directory — placing a watch does not stat the path's
+// contents, and the events arrive on a descriptor.  So the honest row is
+// `[io]`, which SPEC § 5.1 puts pipes, processes and descriptors under,
+// and the polling backend beside it is the one that is `[fs]`.
+//
+// THE FOUR LIMITS, because every one of them is a support question:
+//
+//   - `fs.inotify.max_user_watches` — the total watches one user may
+//     hold, 8192 on a stock kernel and routinely raised to 524288.  A
+//     recursive watch over a repository with a build directory nobody
+//     excluded hits it, which is why `wtfilter.may_descend` decides
+//     before a watch is placed rather than after.
+//   - `fs.inotify.max_user_instances` — how many watchers one user may
+//     have, 128.  Reached by a tool that opens one per project and
+//     never closes them.
+//   - `fs.inotify.max_queued_events` — 16384, and when the queue fills
+//     the kernel DROPS events and sends `IN_Q_OVERFLOW`.  The only
+//     correct response is a full rescan.
+//   - the read buffer.  An event's name is variable-length, so a read
+//     with a buffer smaller than one event answers `EINVAL` and a
+//     watcher with a fixed small buffer stops working on deep paths.
+//
+// `limits_from_proc` reads the first three, so a tool can print them
+// beside its own watch count when a person asks why it stopped noticing
+// changes.
+//
+// WHAT THIS BACKEND CANNOT DO, named rather than discovered.  It does
+// not see changes on a network filesystem, because the kernel is not
+// told about them; it does not see changes made through a bind mount to
+// the same file under another path; and it reports a rename's two halves
+// separately, which `wtevent.pair` puts back together.
+
+use wtevent
+
+// An inotify instance.
+//
+// The descriptor and the read buffer size, which is a field because the
+// right value depends on the tree: a buffer under 4 KB fails on deep
+// paths and one of 64 KB costs nothing on a machine that has memory.
+pub struct WtInotify
+    fd: Int
+    buffer_bytes: Int
+    // Whether the descriptor was opened non-blocking.  `poll` honours
+    // its deadline either way; this is what it uses to do so without a
+    // thread.
+    non_blocking: Bool
+
+// Reading a descriptor costs `[io]`, which is what the impl head
+// declares and the effect checker holds every method to.
+impl WatchBackend[io] for WtInotify
+    // `inotify_add_watch` on this directory.
+    //
+    // The mask is fixed and is not a parameter: create, delete, modify,
+    // attrib, moved-from, moved-to, delete-self, move-self, plus
+    // `IN_ONLYDIR` so a path that is a file is refused rather than
+    // watched uselessly and `IN_EXCL_UNLINK` so events for an unlinked
+    // file stop.  A caller that wanted fewer filters with `WtFilter`,
+    // which is testable; a mask parameter would put a bitfield in a
+    // public surface and give four callers four subtly different
+    // watchers.
+    fn watch(self, path: Str) -> Result<Int, WtFault> [io]
+        todo("watch-nv.wtinotify.WtInotify.watch")
+
+    // `inotify_rm_watch`.  A watch the kernel already removed — because
+    // the directory went away — is not a failure.
+    fn unwatch(self, id: Int) -> Result<Unit, WtFault> [io]
+        todo("watch-nv.wtinotify.WtInotify.unwatch")
+
+    // Read whatever is queued, waiting at most this long.
+    //
+    // One read per call, so a caller that is handed a full buffer calls
+    // again — which `WtPoll.timed_out` being `false` says.
+    fn poll(self, timeout_seconds: Float) -> Result<WtPoll, WtFault> [io]
+        todo("watch-nv.wtinotify.WtInotify.poll")
+
+    // Close the descriptor, which releases every watch on it.
+    fn close(self) -> Result<Unit, WtFault> [io]
+        todo("watch-nv.wtinotify.WtInotify.close")
+
+// The three kernel limits, as they are now.
+pub struct WtInotifyLimits
+    max_user_watches: Int
+    max_user_instances: Int
+    max_queued_events: Int
+
+// Open an inotify instance with a 64 KB buffer.
+//
+// ```novo
+// use wtinotify
+//
+// fn start() -> Result<WtInotify, WtFault> [io]
+//     wtinotify.open()
+//
+// fn main() [io]
+//     println("an inotify watcher")
+// ```
+pub fn open() -> Result<WtInotify, WtFault> [io]
+    todo("watch-nv.wtinotify.open")
+
+// Open one with a buffer the caller sized.
+//
+// Under 4096 is refused rather than accepted and then failing on the
+// first deep path, because `EINVAL` from a read with a short buffer is
+// the least explicable error in this whole surface.
+//
+// ```novo
+// use wtinotify
+//
+// fn start() -> Result<WtInotify, WtFault> [io]
+//     wtinotify.open_with(65536)
+//
+// fn main() [io]
+//     println("an inotify watcher with a chosen buffer")
+// ```
+pub fn open_with(buffer_bytes: Int) -> Result<WtInotify, WtFault> [io]
+    todo("watch-nv.wtinotify.open_with")
+
+// Is this kernel one this backend works on?
+//
+// `[io]`, because it looks.  A tool calls it once at startup and falls
+// back to `wtpoll` when it answers `false`, rather than discovering the
+// answer from a watch that never fires.
+//
+// ```novo
+// use wtinotify
+//
+// fn here() -> Bool [io]
+//     wtinotify.is_available()
+//
+// fn main() [io]
+//     println("whether inotify is here")
+// ```
+pub fn is_available() -> Bool [io]
+    todo("watch-nv.wtinotify.is_available")
+
+// The three limits, read from `/proc/sys/fs/inotify`.
+//
+// `[fs]`, and it is the one row in this module that is not `[io]` —
+// because it genuinely reads three files, and a row that claimed
+// otherwise would be a lie the checker cannot catch.
+//
+// What it is for: a tool that hits `WtWatchLimit` can print "8192
+// watches is the limit and I placed 8192" instead of "too many watches",
+// which is the difference between an operator raising a `sysctl` and an
+// operator filing an issue.
+//
+// ```novo
+// use wtinotify
+//
+// fn limits() -> Result<WtInotifyLimits, WtFault> [fs]
+//     wtinotify.limits_from_proc()
+//
+// fn main() [io]
+//     println("what this kernel allows")
+// ```
+pub fn limits_from_proc() -> Result<WtInotifyLimits, WtFault> [fs]
+    todo("watch-nv.wtinotify.limits_from_proc")
+
+// The stock defaults, for a machine whose `/proc` could not be read.
+//
+// `[]`, so a message can name a number even when the read failed.
+//
+// ```novo
+// use wtinotify
+//
+// fn main() [io]
+//     println("${wtinotify.default_limits().max_user_watches}")
+// ```
+pub fn default_limits() -> WtInotifyLimits []
+    todo("watch-nv.wtinotify.default_limits")
+
+// Would this many watches fit under this limit?
+//
+// `[]`, published because the check belongs BEFORE the walk: a tool
+// that counted the directories it was about to watch and compared them
+// here can tell a person what to do, where one that walked until the
+// kernel refused has already placed eight thousand watches it now has to
+// unwind.
+//
+// ```novo
+// use wtinotify
+//
+// fn room(l: WtInotifyLimits, wanted: Int) -> Bool
+//     wtinotify.fits(l, wanted)
+//
+// fn main() [io]
+//     println("whether a tree will fit under the limit")
+// ```
+pub fn fits(l: WtInotifyLimits, wanted: Int) -> Bool []
+    todo("watch-nv.wtinotify.fits")
+
+// The `sysctl` line that would raise the watch limit to this number.
+//
+// `[]`, and it exists because the line is the whole of what a person
+// needs and nobody remembers it: a tool that prints
+// `fs.inotify.max_user_watches=524288` beside its refusal has solved the
+// problem, and one that prints "too many watches" has moved it.
+//
+// ```novo
+// use wtinotify
+//
+// fn main() [io]
+//     println(wtinotify.raise_limit_hint(524288))
+// ```
+pub fn raise_limit_hint(wanted: Int) -> Str []
+    todo("watch-nv.wtinotify.raise_limit_hint")
+
+// The read buffer size this backend was opened with.
+//
+// ```novo
+// use wtinotify
+//
+// fn main() [io]
+//     println("the buffer an inotify read uses")
+// ```
+pub fn buffer_size(w: WtInotify) -> Int []
+    todo("watch-nv.wtinotify.buffer_size")
+
+// How many watches this instance currently holds.
+//
+// `[]` — the count is the instance's own bookkeeping and reading it
+// touches nothing.
+//
+// ```novo
+// use wtinotify
+//
+// fn held(w: WtInotify) -> Int
+//     wtinotify.watches_held(w)
+//
+// fn main() [io]
+//     println("how many watches an instance holds")
+// ```
+pub fn watches_held(w: WtInotify) -> Int []
+    todo("watch-nv.wtinotify.watches_held")
+
+// What this backend cannot see, as a list a tool can print.
+//
+// Three entries, each a sentence: a network filesystem's changes, a bind
+// mount's second path, and anything that happened between a directory
+// being created and a watch reaching it.  Published as data rather than
+// left in a README, because the question a person asks is "why did it
+// not notice" and the answer should be in the tool they are already
+// looking at.
+//
+// ```novo
+// use wtinotify
+//
+// fn caveats() -> [Str]
+//     wtinotify.known_blind_spots()
+//
+// fn main() [io]
+//     println("what inotify does not see")
+// ```
+pub fn known_blind_spots() -> [Str] []
+    todo("watch-nv.wtinotify.known_blind_spots")
