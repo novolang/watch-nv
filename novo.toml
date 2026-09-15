@@ -1,7 +1,7 @@
 [package]
 name        = "watch-nv"
 license     = "Apache-2.0"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Filesystem watching: an event model in which a rename is one event with two paths, include and exclude decided before a directory is watched rather than after it reports, debouncing as a value with the clock supplied, an inotify backend and a portable polling one behind one trait, and the run-on-change loop a --watch mode is."
 
 # `license` sits immediately after the name, before any value that could

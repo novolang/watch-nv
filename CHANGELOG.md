@@ -5,6 +5,10 @@ All notable changes to watch-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-12
 
 The **interface**: every signature and every effect row, and no bodies.
@@ -52,3 +56,20 @@ The **interface**: every signature and every effect row, and no bodies.
   day before.
 - **No device claim.** `Str`, `Result` and a filesystem are throughout.
 - **One dependency**, glob-nv, by registry range.
+
+### Design notes
+
+- There is no `--watch` verb in the compiler today. Four places would
+  take this package: `novo build --watch` and `novo doc --watch` want
+  `run_on_change` whole with `wtfilter.common_excludes()`; `novo test
+  --watch` wants the same with an action that runs the suites the
+  changed files belong to, which is why `WtEvent.path` is relative; and
+  a language server wants `step` rather than `run_on_change`, because
+  it owns its own event loop and `workspace/didChangeWatchedFiles` is
+  exactly a `[WtEvent]` batch.
+- `novo test --watch` is the reason `WtEvent` carries both ends of a
+  rename. A moved test file must not re-run as a new one and a deleted
+  one.
+- An enum of backends instead of the effect-parameterised interface
+  would charge every caller the union of both backends' effects, the
+  tests included.
