@@ -1,8 +1,6 @@
 // wtfilter.nv — what to watch, decided before a watch is created rather
 // than after an event arrives.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE FILTER ANSWERS TWO DIFFERENT QUESTIONS AND ONLY ONE OF THEM IS
 // ABOUT EVENTS.  `admits` decides whether a path that changed is
 // interesting; `may_descend` decides whether to put a watch on a
@@ -33,6 +31,7 @@
 // NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
 
 use glob
+use wtevent
 
 // What a watch will and will not report.
 //
@@ -53,6 +52,53 @@ pub struct WtFilter
     // would otherwise rebuild everything.
     skip_metadata: Bool
 
+// Whether a path has a component that begins with a dot.
+//
+// `.` and `..` are components rather than hidden names — a walk whose
+// root is spelled `.` would otherwise be skipped wholesale — and an
+// empty component, which is what a leading or a doubled slash leaves, is
+// not a name at all.
+fn hidden(path: Str) -> Bool
+    for part in str.split(path, "/")
+        if part != "" and part != "." and part != ".." and str.starts_with(part, ".")
+            return true
+    false
+
+// The last component of a path, for the checks that are about the name
+// an editor gives a file rather than about where the file sits.
+fn base_name(path: Str) -> Str
+    let parts = str.split(path, "/")
+    if list.len(parts) == 0
+        // cov: skip — str.split answers at least one part for any separator, so an empty list cannot reach this arm
+        path
+    else
+        parts[list.len(parts) - 1]
+
+// Whether any of these patterns matches this path outright.
+fn matched(patterns: [Str], path: Str) -> Bool
+    for p in patterns
+        if glob.matches(p, path)
+            return true
+    false
+
+// Whether any of these patterns could reach something inside this
+// directory, which is a different question from matching it.
+fn reachable(patterns: [Str], path: Str) -> Bool
+    for p in patterns
+        if glob.may_descend(p, path)
+            return true
+    false
+
+// When a pattern list refuses a directory.
+//
+// A directory is refused by matching an exclude or by being able to hold
+// what one reaches: `target/**` must keep a walk out of `target` itself
+// and not only out of the files under it.
+fn excluded(f: WtFilter, path: Str, is_directory: Bool) -> Bool
+    if matched(f.exclude, path)
+        return true
+    is_directory and reachable(f.exclude, path)
+
 // A filter that admits everything.
 //
 // ```novo
@@ -62,7 +108,7 @@ pub struct WtFilter
 //     println("${list.len(wtfilter.everything().include)}")
 // ```
 pub fn everything() -> WtFilter []
-    todo("watch-nv.wtfilter.everything")
+    WtFilter { include: [], exclude: [], skip_hidden: true, skip_metadata: true }
 
 // A filter over these include and exclude patterns, skipping hidden
 // paths and metadata events.
@@ -77,7 +123,7 @@ pub fn everything() -> WtFilter []
 //     println("${list.len(f.exclude)}")
 // ```
 pub fn filter(include: [Str], exclude: [Str]) -> WtFilter []
-    todo("watch-nv.wtfilter.filter")
+    WtFilter { include: include, exclude: exclude, skip_hidden: true, skip_metadata: true }
 
 // The same filter, reporting metadata changes too.
 //
@@ -90,7 +136,8 @@ pub fn filter(include: [Str], exclude: [Str]) -> WtFilter []
 //     println("${wtfilter.with_metadata(wtfilter.everything()).skip_metadata}")
 // ```
 pub fn with_metadata(f: WtFilter) -> WtFilter []
-    todo("watch-nv.wtfilter.with_metadata")
+    WtFilter { include: f.include, exclude: f.exclude, skip_hidden: f.skip_hidden,
+               skip_metadata: false }
 
 // The same filter, reporting hidden paths too.
 //
@@ -101,7 +148,8 @@ pub fn with_metadata(f: WtFilter) -> WtFilter []
 //     println("${wtfilter.with_hidden(wtfilter.everything()).skip_hidden}")
 // ```
 pub fn with_hidden(f: WtFilter) -> WtFilter []
-    todo("watch-nv.wtfilter.with_hidden")
+    WtFilter { include: f.include, exclude: f.exclude, skip_hidden: false,
+               skip_metadata: f.skip_metadata }
 
 // Would this filter report a change to this path?
 //
@@ -117,7 +165,15 @@ pub fn with_hidden(f: WtFilter) -> WtFilter []
 //     println("${wtfilter.admits(f, "src/main.nv", false)}")
 // ```
 pub fn admits(f: WtFilter, path: Str, is_directory: Bool) -> Bool []
-    todo("watch-nv.wtfilter.admits")
+    if f.skip_hidden and hidden(path)
+        return false
+    if excluded(f, path, is_directory)
+        return false
+    if list.len(f.include) == 0
+        return true
+    // A directory the includes cannot name but could reach inside is
+    // admitted, because the changes a caller wants are below it.
+    matched(f.include, path) or is_directory and reachable(f.include, path)
 
 // Would this filter report this event?
 //
@@ -136,7 +192,15 @@ pub fn admits(f: WtFilter, path: Str, is_directory: Bool) -> Bool []
 //     println("whether a filter reports an event")
 // ```
 pub fn admits_event(f: WtFilter, e: WtEvent) -> Bool []
-    todo("watch-nv.wtfilter.admits_event")
+    // A lost queue and a lost watch are never filtered: a consumer that
+    // is not told has already missed changes.
+    if wtevent.demands_rescan(e)
+        return true
+    if f.skip_metadata and e.kind == WtMetadata
+        return false
+    match e.kind
+        WtRenamed(from, to) => admits(f, from, false) or admits(f, to, false)
+        _                   => admits(f, e.path, e.is_directory)
 
 // Is any admitted path possibly under this directory?
 //
@@ -157,7 +221,16 @@ pub fn admits_event(f: WtFilter, e: WtEvent) -> Bool []
 //     println("${wtfilter.may_descend(f, "_novo")}")
 // ```
 pub fn may_descend(f: WtFilter, directory: Str) -> Bool []
-    todo("watch-nv.wtfilter.may_descend")
+    // The root is always descended, or nothing would be watched at all.
+    if directory == "" or directory == "."
+        return true
+    if f.skip_hidden and hidden(directory)
+        return false
+    if excluded(f, directory, true)
+        return false
+    if list.len(f.include) == 0
+        return true
+    matched(f.include, directory) or reachable(f.include, directory)
 
 // Every event in this batch the filter admits.
 //
@@ -176,7 +249,11 @@ pub fn may_descend(f: WtFilter, directory: Str) -> Bool []
 //     println("the events worth reporting")
 // ```
 pub fn admitted(f: WtFilter, events: [WtEvent]) -> [WtEvent] []
-    todo("watch-nv.wtfilter.admitted")
+    var out: [WtEvent] = []
+    for e in events
+        if admits_event(f, e)
+            out = list.push(out, e)
+    out
 
 // Is every pattern in this filter one glob-nv accepts?
 //
@@ -195,7 +272,14 @@ pub fn admitted(f: WtFilter, events: [WtEvent]) -> [WtEvent] []
 //     println("the patterns that will never match anything")
 // ```
 pub fn invalid_patterns(f: WtFilter) -> [Str] []
-    todo("watch-nv.wtfilter.invalid_patterns")
+    var bad: [Str] = []
+    for p in f.include
+        if not glob.is_valid(p)
+            bad = list.push(bad, p)
+    for p in f.exclude
+        if not glob.is_valid(p)
+            bad = list.push(bad, p)
+    bad
 
 // The exclude patterns every tool in this project wants.
 //
@@ -215,7 +299,8 @@ pub fn invalid_patterns(f: WtFilter) -> [Str] []
 //     println("${list.len(wtfilter.common_excludes()) > 0}")
 // ```
 pub fn common_excludes() -> [Str] []
-    todo("watch-nv.wtfilter.common_excludes")
+    ["_novo/**", ".git/**", "target/**", "node_modules/**",
+     "**/*.swp", "**/*~", "**/.#*", "**/4913"]
 
 // Is this path one an editor made and will remove in a moment?
 //
@@ -236,4 +321,9 @@ pub fn common_excludes() -> [Str] []
 //     println("${wtfilter.is_editor_artifact(".main.nv.swp")}")
 // ```
 pub fn is_editor_artifact(path: Str) -> Bool []
-    todo("watch-nv.wtfilter.is_editor_artifact")
+    let name = base_name(path)
+    if str.ends_with(name, ".swp") or str.ends_with(name, "~")
+        return true
+    if str.starts_with(name, ".#")
+        return true
+    name == "4913"

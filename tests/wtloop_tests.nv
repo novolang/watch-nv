@@ -1,8 +1,5 @@
 // wtloop_tests.nv — the loop, and the row the compiler insisted on.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: watch-nv.wtloop.<fn>`.
-//
 // THE ASSERTION THE COMPILER MAKES is `tick` below: one turn of a watch
 // loop declared `[]`, over the replay backend.  That is the whole claim
 // of this package in one signature — a tool's watch behaviour is
@@ -104,7 +101,7 @@ fn test_a_turn_that_did_nothing_is_not_worth_a_line() [io]
                          watches_added: 0, faults: [] }
 
     test.case("or a watch mode prints one a second forever")
-    test.assert(wtloop.turn_is_notable(quiet) == false)
+    test.assert(not wtloop.turn_is_notable(quiet))
 
 @test
 fn test_a_turn_that_acted_or_rescanned_or_faulted_is() [io]

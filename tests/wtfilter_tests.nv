@@ -1,8 +1,5 @@
 // wtfilter_tests.nv — the descend decision, which is the expensive one.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: watch-nv.wtfilter.<fn>`.
-//
 // `may_descend` IS WHAT THE FILE IS FOR.  A filter that only decided
 // about events would place a watch on every directory in a repository —
 // two hundred thousand of them in one with a build directory nobody
@@ -31,22 +28,22 @@ fn test_exclude_beats_include_whatever_the_order() [io]
     test.assert(wtfilter.admits(f, "src/main.nv", false))
 
     test.case("and an excluded one is not, even though it matches the include")
-    test.assert(wtfilter.admits(f, "_novo/main.nv", false) == false)
+    test.assert(not wtfilter.admits(f, "_novo/main.nv", false))
 
 @test
 fn test_a_path_matching_no_include_is_refused() [io]
     let f = wtfilter.filter(["**/*.nv"], [])
 
     test.case("a non-empty include list is a whitelist")
-    test.assert(wtfilter.admits(f, "README.md", false) == false)
+    test.assert(not wtfilter.admits(f, "README.md", false))
 
 @test
 fn test_hidden_paths_are_skipped_by_default() [io]
     let f = wtfilter.everything()
 
     test.case("a dot directory at any depth")
-    test.assert(wtfilter.admits(f, ".git/HEAD", false) == false)
-    test.assert(wtfilter.admits(f, "src/.cache/x", false) == false)
+    test.assert(not wtfilter.admits(f, ".git/HEAD", false))
+    test.assert(not wtfilter.admits(f, "src/.cache/x", false))
 
     test.case("and a caller can ask for them")
     test.assert(wtfilter.admits(wtfilter.with_hidden(f), ".git/HEAD", false))
@@ -56,7 +53,7 @@ fn test_an_excluded_directory_is_never_descended_into() [io]
     let f = wtfilter.filter(["**/*.nv"], ["_novo/**"])
 
     test.case("so no watch is placed anywhere beneath it")
-    test.assert(wtfilter.may_descend(f, "_novo") == false)
+    test.assert(not wtfilter.may_descend(f, "_novo"))
 
     test.case("and one that could hold something interesting is descended")
     test.assert(wtfilter.may_descend(f, "src"))
@@ -69,7 +66,7 @@ fn test_the_descend_decision_is_conservative() [io]
     test.assert(wtfilter.may_descend(f, "src"))
 
     test.case("one the pattern cannot reach is not — which is the whole saving")
-    test.assert(wtfilter.may_descend(f, "docs") == false)
+    test.assert(not wtfilter.may_descend(f, "docs"))
 
     test.case("and the root is always descended, or nothing would be watched at all")
     test.assert(wtfilter.may_descend(f, ""))
@@ -80,7 +77,7 @@ fn test_metadata_events_are_skipped_by_default() [io]
     let meta = wtevent.event(WtMetadata, "src/main.nv", false, 0.0, 1)
 
     test.case("so a chmod -R over a checkout does not rebuild everything")
-    test.assert(wtfilter.admits_event(f, meta) == false)
+    test.assert(not wtfilter.admits_event(f, meta))
 
     test.case("and a tool that cares can ask")
     test.assert(wtfilter.admits_event(wtfilter.with_metadata(f), meta))
@@ -95,8 +92,8 @@ fn test_either_end_of_a_rename_being_admitted_is_enough() [io]
     test.assert(wtfilter.admits_event(f, out_of))
 
     test.case("and a rename entirely outside it is not")
-    test.assert(wtfilter.admits_event(f,
-        wtevent.event(WtRenamed("docs/a", "docs/b"), "docs/b", false, 0.0, 1)) == false)
+    test.assert(not wtfilter.admits_event(f,
+        wtevent.event(WtRenamed("docs/a", "docs/b"), "docs/b", false, 0.0, 1)))
 
 @test
 fn test_an_overflow_is_never_filtered_away() [io]
@@ -132,7 +129,7 @@ fn test_the_common_excludes_cover_what_every_tool_wants_gone() [io]
     test.assert(list.len(e) > 0)
 
     test.case("and a filter built from them excludes this project's own build directory")
-    test.assert(wtfilter.admits(wtfilter.filter([], e), "_novo/out.ll", false) == false)
+    test.assert(not wtfilter.admits(wtfilter.filter([], e), "_novo/out.ll", false))
 
 @test
 fn test_an_editor_artifact_is_recognised_before_it_causes_a_rebuild() [io]
@@ -149,4 +146,4 @@ fn test_an_editor_artifact_is_recognised_before_it_causes_a_rebuild() [io]
     test.assert(wtfilter.is_editor_artifact("4913"))
 
     test.case("and the file a person is actually editing is not one")
-    test.assert(wtfilter.is_editor_artifact("main.nv") == false)
+    test.assert(not wtfilter.is_editor_artifact("main.nv"))

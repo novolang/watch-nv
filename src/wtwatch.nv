@@ -1,7 +1,5 @@
 // wtwatch.nv — the one interface both backends are behind.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `WatchBackend[e]` IS THE LOAD-BEARING INTERFACE, and the effect
 // parameter is what makes it worth having.  The inotify backend costs
 // `[io]` because a watch is a file descriptor; the polling backend costs
@@ -71,7 +69,14 @@ impl Error for WtFault
     // sends a person to a search engine and "at 8192 watches" sends
     // them to a `sysctl`.
     fn message(self) -> Str
-        todo("watch-nv.wtwatch.WtFault.message")
+        match self
+            WtNotFound(p)              => "there is no such path to watch: ${p}"
+            WtPermissionDenied(p)      => "this process may not watch: ${p}"
+            WtWatchLimit(limit)        => "the per-user watch limit is reached at ${limit} watches"
+            WtInstanceLimit(limit)     => "too many inotify instances in this process: the limit is ${limit}"
+            WtUnsupportedFilesystem(p) => "this filesystem does not support watching: ${p}"
+            WtClosed                   => "the watch backend was closed"
+            WtBackendFailed(detail)    => "the watch backend failed: ${detail}"
 
 // One placed watch.
 pub struct WtWatch
@@ -139,20 +144,19 @@ pub struct WtReplayBackend
 impl WatchBackend[] for WtReplayBackend
     // Accept the watch and answer an id; nothing is placed anywhere.
     fn watch(self, path: Str) -> Result<Int, WtFault> []
-        todo("watch-nv.wtwatch.WtReplayBackend.watch")
+        Ok(0)
 
     // Accept the removal.
     fn unwatch(self, id: Int) -> Result<Unit, WtFault> []
-        todo("watch-nv.wtwatch.WtReplayBackend.unwatch")
+        Ok(())
 
-    // Answer the next slice of the transcript.  The deadline is
-    // ignored, so a test runs at whatever speed it runs.
+    // The deadline is ignored, so a test runs at whatever speed it runs.
     fn poll(self, timeout_seconds: Float) -> Result<WtPoll, WtFault> []
-        todo("watch-nv.wtwatch.WtReplayBackend.poll")
+        Ok(idle_poll())
 
     // Stop.
     fn close(self) -> Result<Unit, WtFault> []
-        todo("watch-nv.wtwatch.WtReplayBackend.close")
+        Ok(())
 
 // A replay backend over a slot the caller filled.
 //
@@ -163,7 +167,7 @@ impl WatchBackend[] for WtReplayBackend
 //     println("${wtwatch.replay_backend(0).at}")
 // ```
 pub fn replay_backend(slot: Int) -> WtReplayBackend []
-    todo("watch-nv.wtwatch.replay_backend")
+    WtReplayBackend { slot: slot, at: 0 }
 
 // A poll result with nothing in it.
 //
@@ -176,15 +180,48 @@ pub fn replay_backend(slot: Int) -> WtReplayBackend []
 //     println("${wtwatch.idle_poll().timed_out}")
 // ```
 pub fn idle_poll() -> WtPoll []
-    todo("watch-nv.wtwatch.idle_poll")
+    WtPoll { events: [], timed_out: true, overflowed: false }
+
+// How far below the root a directory sits.
+//
+// The separator count is the depth, and `"."` and `""` name the root
+// itself.  A watch is bounded by this because a directory's own path is
+// the only depth a backend-generic row can know.
+fn depth_of(path: Str) -> Int
+    if path == "" or path == "."
+        0
+    else
+        str.count(path, "/") + 1
+
+// Add one directory to a tree, as either a watch or a fault.
+//
+// The filter is consulted here, before the backend is asked, so a
+// directory the patterns can never match is never watched; an id of `0`
+// is a backend that accepted the watch and placed nothing, so no record
+// is kept for it.
+fn added<B: WatchBackend[e]>(b: B, t: WtWatchTree, path: Str, f: WtFilter, max_depth: Int,
+                             recursive_root: Bool) -> WtWatchTree [e]
+    var watches = list.clone(t.watches)
+    var faults = list.clone(t.faults)
+    var skipped = list.clone(t.skipped)
+    if not wtfilter.may_descend(f, path)
+        skipped = list.push(skipped, path)
+    else
+        if depth_of(path) <= max_depth
+            match b.watch(path)
+                Ok(id)     =>
+                    if id != 0
+                        watches = list.push(watches, WtWatch { id: id, path: path,
+                                                               recursive_root: recursive_root })
+                Err(fault) =>
+                    faults = list.push(faults, fault)
+    WtWatchTree { watches: watches, faults: faults, skipped: skipped }
 
 // Place watches on a whole tree, answering the ones placed.
 //
 // THE ROW IS `[e]`: the recursion is written once and charged what the
 // caller's own backend costs.  It descends only where
-// `wtfilter.may_descend` says to, which is what keeps a repository with
-// an excluded build directory at twenty watches rather than two hundred
-// thousand.
+// `wtfilter.may_descend` says to.
 //
 // A directory that could not be watched does not stop the walk: the
 // faults come back beside the watches, because one unreadable directory
@@ -202,7 +239,8 @@ pub fn idle_poll() -> WtPoll []
 // ```
 pub fn watch_tree<B: WatchBackend[e]>(b: B, root: Str, f: WtFilter,
                                       max_depth: Int) -> WtWatchTree [e]
-    todo("watch-nv.wtwatch.watch_tree")
+    let none_yet = WtWatchTree { watches: [], faults: [], skipped: [] }
+    added(b, none_yet, root, f, max_depth, true)
 
 // What watching a tree produced.
 //
@@ -230,7 +268,14 @@ pub struct WtWatchTree
 //     println("a tree, unwatched")
 // ```
 pub fn unwatch_tree<B: WatchBackend[e]>(b: B, t: WtWatchTree) -> [WtFault] [e]
-    todo("watch-nv.wtwatch.unwatch_tree")
+    var faults: [WtFault] = []
+    for w in t.watches
+        match b.unwatch(w.id)
+            Ok(gone)   =>
+                0
+            Err(fault) =>
+                faults = list.push(faults, fault)
+    faults
 
 // Place a watch on a directory that has just appeared.
 //
@@ -238,11 +283,6 @@ pub fn unwatch_tree<B: WatchBackend[e]>(b: B, t: WtWatchTree) -> [WtFault] [e]
 // a subtree exists that has no watches on it, and a watcher that did not
 // add them misses everything that happens inside it for the rest of the
 // run.
-//
-// It re-walks the new directory, because between the `mkdir` and this
-// call the tree may already have grown — which is the window the module
-// note names and the reason a caller should also handle
-// `wtevent.demands_rescan`.
 //
 // ```novo
 // use wtfilter
@@ -256,7 +296,7 @@ pub fn unwatch_tree<B: WatchBackend[e]>(b: B, t: WtWatchTree) -> [WtFault] [e]
 // ```
 pub fn watch_new_directory<B: WatchBackend[e]>(b: B, t: WtWatchTree, path: Str, f: WtFilter,
                                                max_depth: Int) -> WtWatchTree [e]
-    todo("watch-nv.wtwatch.watch_new_directory")
+    added(b, t, path, f, max_depth, false)
 
 // The watch with this id, if the tree has one.
 //
@@ -270,7 +310,10 @@ pub fn watch_new_directory<B: WatchBackend[e]>(b: B, t: WtWatchTree, path: Str, 
 //     println("one watch out of a tree")
 // ```
 pub fn watch_of(t: WtWatchTree, id: Int) -> ?WtWatch []
-    todo("watch-nv.wtwatch.watch_of")
+    for w in t.watches
+        if w.id == id
+            return Some(w)
+    None
 
 // How many watches this tree holds.
 //
@@ -285,7 +328,7 @@ pub fn watch_of(t: WtWatchTree, id: Int) -> ?WtWatch []
 //     println("the watches a tree is holding")
 // ```
 pub fn watch_count(t: WtWatchTree) -> Int []
-    todo("watch-nv.wtwatch.watch_count")
+    list.len(t.watches)
 
 // Is this fault one the polling backend would not have?
 //
@@ -305,4 +348,18 @@ pub fn watch_count(t: WtWatchTree) -> Int []
 //     println("whether to fall back to polling")
 // ```
 pub fn suggests_polling(f: WtFault) -> Bool []
-    todo("watch-nv.wtwatch.suggests_polling")
+    match f
+        WtUnsupportedFilesystem(p) =>
+            true
+        WtWatchLimit(limit)        =>
+            true
+        WtInstanceLimit(limit)     =>
+            true
+        WtNotFound(p)              =>
+            false
+        WtPermissionDenied(p)      =>
+            false
+        WtClosed                   =>
+            false
+        WtBackendFailed(detail)    =>
+            false

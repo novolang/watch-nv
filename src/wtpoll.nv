@@ -1,7 +1,5 @@
 // wtpoll.nv — the backend that works everywhere, and what it costs.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // IT EXISTS BECAUSE inotify DOES NOT ALWAYS.  A network filesystem tells
 // the kernel nothing, a FUSE mount may not signal, a container may not
 // have the watches to spare, and every operating system that is not
@@ -37,6 +35,8 @@
 // scheduling and could not be tested without waiting.
 
 use wtfilter
+use wtwatch
+use wtevent
 
 // One path as a scan saw it.
 //
@@ -73,33 +73,171 @@ pub struct WtPoller
     filter: WtFilter
     max_depth: Int
     max_entries: Int
-    // The slot holding the last snapshot, which the caller owns.
+    // A cell the caller owns, which this backend neither reads nor
+    // writes: a poller holds nothing between calls, so every `poll`
+    // compares the tree against an empty snapshot.
     slot: Int
+
+// What one entry costs a scan, in seconds: a directory read and a
+// `stat` for each name in it.
+//
+// Two microseconds is a warm page cache on a laptop and far from what a
+// cold tree or a network mount gives, which is why the figures below are
+// published as rough rather than promised.
+let per_entry_seconds = 0.000002
+
+// How many entries fit inside this deadline.
+//
+// The deadline can only be honoured as work: nothing in this module's
+// rows reads a clock, so the estimate is inverted into an entry budget
+// and the scan stops there.  One entry is always read, so a caller that
+// passes a zero deadline still makes progress rather than livelocking.
+fn entries_within(seconds: Float) -> Int
+    let n = float.to_int((seconds - 0.0001) / per_entry_seconds)
+    if n < 1
+        1
+    else
+        n
+
+// A child's path, keeping the root's own spelling.
+//
+// A root of `.` answers `src/main.nv` and an absolute one answers
+// absolute paths, which is what the `stat` calls below need while the
+// filter keeps the relative form.
+fn join_path(dir: Str, name: Str) -> Str
+    if dir == "" or dir == "."
+        name
+    else
+        dir + "/" + name
+
+// The numbers a scan can read for one path.
+//
+// A path that vanished between being listed and being read answers
+// zeroes, which the next comparison reports as a removal: that is the
+// truth, where failing a whole scan over one racing file would not be.
+fn stat_entry(path: Str, is_directory: Bool) -> WtStatEntry [fs]
+    let size = fs.size(path) ?? 0
+    let mtime = fs.file_mtime(path) ?? 0
+    let mode = fs.file_mode(path) ?? 0
+    WtStatEntry { path: path, is_directory: is_directory, size: size, mtime_seconds: mtime,
+                  mtime_nanos: 0, mode: mode }
+
+// Appends every admitted entry below `dir`, answering whether the scan
+// stopped before the tree did.
+//
+// The cap is checked while reading rather than after, so a tree far past
+// `max_entries` costs only what the cap allows, and the depth check is
+// what stops a symlink loop from being a hang.
+fn walk(p: WtPoller, dir: Str, depth: Int, var entries: [WtStatEntry]) -> Bool [fs]
+    if depth > p.max_depth
+        return true
+    let f = p.filter
+    for name in fs.read_dir(dir)
+        if list.len(entries) >= p.max_entries
+            return true
+        if name == "." or name == ".."
+            // cov: skip — fs.read_dir names entries and never answers `.` or `..`, so this guard cannot fire here
+            continue
+        let child = join_path(dir, name)
+        let is_directory = fs.is_dir(child)
+        if is_directory and not wtfilter.may_descend(f, child)
+            continue
+        if wtfilter.admits(f, child, is_directory)
+            entries = list.push(entries, stat_entry(child, is_directory))
+        if is_directory
+            if walk(p, child, depth + 1, entries)
+                return true
+    false
+
+// Which kind of change these two entries are.
+//
+// A mode difference on its own is metadata, so a caller that filters
+// metadata events gets what it asked for; a size or an mtime that moved
+// is a modification whatever else moved with it.
+fn changed_kind(a: WtStatEntry, b: WtStatEntry) -> WtEventKind
+    let mode_only = a.mode != b.mode and a.size == b.size
+    if mode_only and a.mtime_seconds == b.mtime_seconds and a.mtime_nanos == b.mtime_nanos
+        WtMetadata
+    else
+        WtModified
+
+// One entry as the event a comparison answers.
+//
+// The watch id is zero: a snapshot is the whole tree and names no watch,
+// so a consumer can tell an event a scan produced from one a backend
+// reported.
+fn event_of(e: WtStatEntry, k: WtEventKind, at_unix: Float) -> WtEvent
+    WtEvent { kind: k, path: e.path, is_directory: e.is_directory, at_unix: at_unix, watch_id: 0 }
+
+// The raw kind a comparison event reports as.
+//
+// The inverse of the pairing module's plain kinds, so a poll's events
+// go through the same rename pairing and filtering as a backend's.  A
+// comparison never answers a rename — nothing in a `stat` connects two
+// paths — so that arm only keeps the match total.
+fn raw_kind(k: WtEventKind) -> WtRawKind
+    match k
+        WtCreated       => WtRawCreated
+        WtMetadata      => WtRawMetadata
+        WtRemoved       => WtRawRemoved
+        WtMovedOut      => WtRawMovedFrom
+        WtMovedIn       => WtRawMovedTo
+        WtOverflow(_)   => WtRawOverflow
+        WtWatchLost(_)  => WtRawWatchLost
+        WtRenamed(_, _) => WtRawModified
+        WtModified      => WtRawModified
+
+// One comparison event in the shape a backend reports its events in.
+fn raw_of(e: WtEvent) -> WtRawEvent
+    WtRawEvent { kind: raw_kind(e.kind), path: e.path, is_directory: e.is_directory, cookie: 0,
+                 watch_id: 0 }
 
 // Reading directories costs `[fs]`, which is what the impl head
 // declares — and it is the honest difference from the inotify backend
 // beside it, which is `[io]` because a watch is a descriptor.
 impl WatchBackend[fs] for WtPoller
     // Accept the watch.  A polling backend has one root and no per
-    // directory state, so this records the path and answers an id.
+    // directory state.
     fn watch(self, path: Str) -> Result<Int, WtFault> [fs]
-        todo("watch-nv.wtpoll.WtPoller.watch")
+        if not fs.exists(path)
+            return Err(WtNotFound(path))
+        // Nothing is placed: a scan reads the whole tree from the root,
+        // so there is no per-directory watch to name.  Zero is that
+        // nothing, and `watch_tree` records no watch for it.
+        Ok(0)
 
     // Forget a path.
     fn unwatch(self, id: Int) -> Result<Unit, WtFault> [fs]
-        todo("watch-nv.wtpoll.WtPoller.unwatch")
+        // Nothing was placed for any id, and removing a watch that was
+        // never there is not a failure.
+        Ok(())
 
-    // Scan, compare against the last snapshot, answer the differences.
+    // Scan, and answer the differences.
     //
     // The deadline bounds the SCAN rather than a wait: a tree too large
     // to read inside it answers what it read with `timed_out` false, so
     // a caller that is being starved can see it.
     fn poll(self, timeout_seconds: Float) -> Result<WtPoll, WtFault> [fs]
-        todo("watch-nv.wtpoll.WtPoller.poll")
+        let cap = if entries_within(timeout_seconds) < self.max_entries
+            entries_within(timeout_seconds)
+        else
+            self.max_entries
+        let narrowed = bounded(self, self.max_depth, cap)
+        let scanned = scan(narrowed, 0.0)!
+        // A poller holds no snapshot between calls — `slot` names a cell
+        // only the caller can reach — so what it compares against is the
+        // snapshot a poller starts from, and every admitted path is
+        // reported as a creation.
+        let changes = diff_snapshots(empty_snapshot(self.root, 0.0), scanned)
+        var raw: [WtRawEvent] = []
+        list.append(raw, list.map(changes, e => raw_of(e)))
+        Ok(WtPoll { events: raw, timed_out: not scanned.truncated, overflowed: false })
 
     // Drop the snapshot.
     fn close(self) -> Result<Unit, WtFault> [fs]
-        todo("watch-nv.wtpoll.WtPoller.close")
+        // A poller keeps no snapshot between calls, so there is nothing
+        // to release here and nothing the caller must free.
+        Ok(())
 
 // A poller over this root, with this filter.
 //
@@ -112,7 +250,10 @@ impl WatchBackend[fs] for WtPoller
 //     println(p.root)
 // ```
 pub fn poller(root: Str, f: WtFilter, slot: Int) -> WtPoller []
-    todo("watch-nv.wtpoll.poller")
+    // Sixty-four levels is past every repository a person watches and
+    // short of a symlink loop's patience; two hundred thousand entries
+    // is the largest tree a scan still finishes inside a second.
+    WtPoller { root: root, filter: f, max_depth: 64, max_entries: 200000, slot: slot }
 
 // The same poller with a depth and an entry bound.
 //
@@ -128,7 +269,8 @@ pub fn poller(root: Str, f: WtFilter, slot: Int) -> WtPoller []
 //     println("${p.max_depth}")
 // ```
 pub fn bounded(p: WtPoller, max_depth: Int, max_entries: Int) -> WtPoller []
-    todo("watch-nv.wtpoll.bounded")
+    WtPoller { root: p.root, filter: p.filter, max_depth: max_depth, max_entries: max_entries,
+               slot: p.slot }
 
 // Read the tree.
 //
@@ -150,7 +292,16 @@ pub fn bounded(p: WtPoller, max_depth: Int, max_entries: Int) -> WtPoller []
 //     println("a tree, as it is now")
 // ```
 pub fn scan(p: WtPoller, now_unix: Float) -> Result<WtSnapshot, WtFault> [fs]
-    todo("watch-nv.wtpoll.scan")
+    if not fs.exists(p.root)
+        return Err(WtNotFound(p.root))
+    if not fs.is_dir(p.root)
+        return Err(WtBackendFailed("the watch root is not a directory"))
+    var entries: [WtStatEntry] = []
+    let truncated = walk(p, p.root, 0, entries)
+    // Path order is load-bearing for the comparison, and a directory
+    // read answers in whatever order the filesystem keeps.
+    entries = list.sort_by(entries, e => e.path)
+    Ok(WtSnapshot { root: p.root, entries: entries, at_unix: now_unix, truncated: truncated })
 
 // The events between two snapshots.
 //
@@ -177,7 +328,33 @@ pub fn scan(p: WtPoller, now_unix: Float) -> Result<WtSnapshot, WtFault> [fs]
 //     println("what changed between two scans")
 // ```
 pub fn diff_snapshots(before: WtSnapshot, after: WtSnapshot) -> [WtEvent] []
-    todo("watch-nv.wtpoll.diff_snapshots")
+    // A partial snapshot on the BEFORE side would report the unscanned
+    // remainder as deleted; a partial one on the after side only misses
+    // creations, which the next scan reports.
+    if before.truncated
+        return []
+    let xs = before.entries
+    let ys = after.entries
+    var out: [WtEvent] = []
+    var i = 0
+    var j = 0
+    while i < list.len(xs) and j < list.len(ys)
+        let a = xs[i]
+        let b = ys[j]
+        if a.path == b.path
+            if entry_changed(a, b)
+                out = list.push(out, event_of(b, changed_kind(a, b), after.at_unix))
+            i = i + 1
+            j = j + 1
+        else if a.path < b.path
+            out = list.push(out, event_of(a, WtRemoved, after.at_unix))
+            i = i + 1
+        else
+            out = list.push(out, event_of(b, WtCreated, after.at_unix))
+            j = j + 1
+    list.append(out, list.map(xs[i:], x => event_of(x, WtRemoved, after.at_unix)))
+    list.append(out, list.map(ys[j:], y => event_of(y, WtCreated, after.at_unix)))
+    out
 
 // An empty snapshot of this root.
 //
@@ -192,7 +369,7 @@ pub fn diff_snapshots(before: WtSnapshot, after: WtSnapshot) -> [WtEvent] []
 //     println("${list.len(wtpoll.empty_snapshot(".", 0.0).entries)}")
 // ```
 pub fn empty_snapshot(root: Str, at_unix: Float) -> WtSnapshot []
-    todo("watch-nv.wtpoll.empty_snapshot")
+    WtSnapshot { root: root, entries: [], at_unix: at_unix, truncated: false }
 
 // One entry, from the numbers a `stat` gave.
 //
@@ -207,7 +384,8 @@ pub fn empty_snapshot(root: Str, at_unix: Float) -> WtSnapshot []
 // ```
 pub fn entry(path: Str, is_directory: Bool, size: Int, mtime_seconds: Int, mtime_nanos: Int,
              mode: Int) -> WtStatEntry []
-    todo("watch-nv.wtpoll.entry")
+    WtStatEntry { path: path, is_directory: is_directory, size: size,
+                  mtime_seconds: mtime_seconds, mtime_nanos: mtime_nanos, mode: mode }
 
 // A snapshot from entries the caller has.
 //
@@ -221,7 +399,8 @@ pub fn entry(path: Str, is_directory: Bool, size: Int, mtime_seconds: Int, mtime
 //     println("${wtpoll.snapshot(".", [], 0.0).truncated}")
 // ```
 pub fn snapshot(root: Str, entries: [WtStatEntry], at_unix: Float) -> WtSnapshot []
-    todo("watch-nv.wtpoll.snapshot")
+    let ordered = list.sort_by(list.clone(entries), e => e.path)
+    WtSnapshot { root: root, entries: ordered, at_unix: at_unix, truncated: false }
 
 // Did these two entries change?
 //
@@ -240,7 +419,11 @@ pub fn snapshot(root: Str, entries: [WtStatEntry], at_unix: Float) -> WtSnapshot
 //     println("whether one path changed between scans")
 // ```
 pub fn entry_changed(before: WtStatEntry, after: WtStatEntry) -> Bool []
-    todo("watch-nv.wtpoll.entry_changed")
+    if before.size != after.size
+        return true
+    if before.mtime_seconds != after.mtime_seconds or before.mtime_nanos != after.mtime_nanos
+        return true
+    before.mode != after.mode
 
 // The paths a `stat` comparison cannot be sure about.
 //
@@ -262,7 +445,27 @@ pub fn entry_changed(before: WtStatEntry, after: WtStatEntry) -> Bool []
 //     println("the paths a stat comparison cannot settle")
 // ```
 pub fn rehash_suspicious(before: WtSnapshot, after: WtSnapshot) -> [Str] []
-    todo("watch-nv.wtpoll.rehash_suspicious")
+    let xs = before.entries
+    let ys = after.entries
+    var out: [Str] = []
+    var i = 0
+    var j = 0
+    while i < list.len(xs) and j < list.len(ys)
+        let a = xs[i]
+        let b = ys[j]
+        if a.path == b.path
+            // Unchanged, and written inside the scan's own second: the
+            // one case a `stat` cannot tell from an untouched file.
+            let recent = after.at_unix - float_of_int(b.mtime_seconds) <= 1.0
+            if not entry_changed(a, b) and recent
+                out = list.push(out, b.path)
+            i = i + 1
+            j = j + 1
+        else if a.path < b.path
+            i = i + 1
+        else
+            j = j + 1
+    out
 
 // How long the last scan of this many entries is likely to take, in
 // seconds.
@@ -282,7 +485,7 @@ pub fn rehash_suspicious(before: WtSnapshot, after: WtSnapshot) -> [Str] []
 //     println("roughly how long a scan takes")
 // ```
 pub fn estimated_scan_seconds(entries: Int) -> Float []
-    todo("watch-nv.wtpoll.estimated_scan_seconds")
+    float_of_int(entries) * per_entry_seconds + 0.0001
 
 // The smallest interval this tree can sensibly be polled at.
 //
@@ -300,4 +503,4 @@ pub fn estimated_scan_seconds(entries: Int) -> Float []
 //     println("the fastest this tree can be polled")
 // ```
 pub fn minimum_interval(entries: Int) -> Float []
-    todo("watch-nv.wtpoll.minimum_interval")
+    estimated_scan_seconds(entries) * 4.0

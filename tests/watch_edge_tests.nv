@@ -1,0 +1,814 @@
+// watch_edge_tests.nv — the branches a suite of values cannot reach.
+//
+// THE OTHER SEVEN SUITES ARE VALUES: no clock is read, no directory is
+// opened, and every case is an argument.  That is what makes them
+// microseconds, and it is also what leaves 45 per cent of `src/` unrun —
+// the inotify backend is a descriptor, the poller opens directories,
+// and the loop sleeps between turns.  This suite is the other half.
+//
+// IT TOUCHES ONE MACHINE, AND ONLY HERE.  One real watcher is opened
+// under `fs.temp_dir` and driven through the events a kernel reports
+// for a write, a rename, a mkdir and an rmdir; one real tree is walked
+// by the poller; and `wtloop.run_on_change` is run to its end over a
+// backend this file owns, which answers a script of two batches so the
+// loop exits on the action's word rather than on a signal.
+//
+// AN INOTIFY BUFFER IS BYTES, SO IT IS TESTED AS BYTES.  `raw_events`
+// is a pure function over a read buffer, and the arms a healthy kernel
+// never produces — a queue overflow, an unmount — are records this
+// file writes with `bytes.set_u32_le`.  The alternative is a suite that
+// fails on somebody else's machine, or a claim nobody checked.
+//
+// WHAT IS LEFT IS EXCUSED WHERE IT LIVES.  The arms no healthy machine
+// reaches — an `inotify_init1` that was refused, a read that failed
+// after the readiness call said ready — carry a `cov: skip` marker
+// with its reason in `src/`, not an assertion that would fail on the
+// machine of whoever runs it.
+
+use std.test
+use std.fs
+use wtevent
+use wtfilter
+use wtdebounce
+use wtwatch
+use wtpoll
+use wtinotify
+use wtloop
+
+// The path the scripted action stops on.
+let stop_path = "stop.txt"
+
+// The three answers the scripted backend gives: a tree walk that is
+// answered, one that is refused at every watch, and one whose removals
+// fail.
+let answers_watches  = 0
+let refuses_watches  = 1
+let refuses_removals = 2
+
+// A backend whose watch answers are this mode and whose polls are a
+// script: the first is the batch a loop is told to act on, and every
+// later one carries the path the action stops on.
+//
+// The slot is a word the caller allocated, because a value receiver
+// cannot count its own calls and nothing here may write to a global.
+struct ScriptBackend
+    slot: Int
+    mode: Int
+
+impl WatchBackend[] for ScriptBackend
+    // One directory: answered with an id, or refused when the mode says
+    // so.
+    fn watch(self, path: Str) -> Result<Int, WtFault> []
+        if self.mode == refuses_watches
+            Err(WtBackendFailed("no watch was placed on " + path))
+        else if self.mode == refuses_removals
+            Ok(77)
+        else
+            Ok(99)
+
+    // Removals answer, except in the mode that refuses them.
+    fn unwatch(self, id: Int) -> Result<Unit, WtFault> []
+        if self.mode == refuses_removals
+            Err(WtClosed)
+        else
+            Ok(())
+
+    // The batch to act on the first time, the batch to stop on after.
+    fn poll(self, timeout_seconds: Float) -> Result<WtPoll, WtFault> []
+        let poll_number = ptr.read_word(self.slot)
+        ptr.write_word(self.slot, poll_number + 1)
+        if poll_number == 0
+            Ok(WtPoll { events: first_batch(), timed_out: false, overflowed: false })
+        else
+            Ok(WtPoll { events: [wtevent.raw(WtRawRemoved, stop_path, false, 0, 77)],
+                        timed_out: true, overflowed: false })
+
+    // Nothing is held between turns.
+    fn close(self) -> Result<Unit, WtFault> []
+        Ok(())
+
+// The batch a loop is told to act on: an overflow, which demands the
+// watches be placed again, and a directory, which demands a watch on a
+// subtree that has just appeared.
+fn first_batch() -> [WtRawEvent]
+    [wtevent.raw(WtRawOverflow, "", false, 0, 0),
+     wtevent.raw(WtRawCreated, "newdir", true, 0, 77)]
+
+// Stop when a batch carries the path the script ends on.
+fn stop_when_told(events: [WtEvent]) -> Bool [io]
+    var going = true
+    for e in events
+        if e.path == stop_path
+            going = false
+    going
+
+// One inotify record: the four header words a kernel writes, then the
+// name field padded to sixteen bytes with NULs.
+//
+// The layout is the one `wtinotify.raw_events` reads, so a buffer built
+// from these is a buffer a descriptor would have answered.
+fn record(wd: Int, mask: Int, cookie: Int, name: Str) -> Bytes
+    let text = bytes.from_str(name)
+    var field = 16
+    while field < bytes.len(text) + 1
+        field = field + 16
+    var head = bytes.zeros(16)
+    head = bytes.set_u32_le(head, 0, wd)
+    head = bytes.set_u32_le(head, 4, mask)
+    head = bytes.set_u32_le(head, 8, cookie)
+    head = bytes.set_u32_le(head, 12, field)
+    let padding = bytes.zeros(field - bytes.len(text))
+    let field_bytes = bytes.concat([text, padding])
+    bytes.concat([head, field_bytes])
+
+// How many of these events carry this raw kind and this path.
+fn count_of(kind: WtRawKind, path: Str, events: [WtRawEvent]) -> Int
+    var n = 0
+    for e in events
+        if e.kind == kind and e.path == path
+            n = n + 1
+    n
+
+// The cookie on the first event of this kind and path, or zero.
+fn cookie_of(kind: WtRawKind, path: Str, events: [WtRawEvent]) -> Int
+    var found = 0
+    for e in events
+        if e.kind == kind and e.path == path
+            found = e.cookie
+    found
+
+// The watch id of a lost watch in this batch, or zero.
+fn lost_watch_id(events: [WtRawEvent]) -> Int
+    var found = 0
+    for e in events
+        if e.kind == WtRawWatchLost
+            found = e.watch_id
+    found
+
+// Remove one scratch tree, leaves first.
+fn remove_tree(dir: Str) [io, fs]
+    let _ = fs.delete(dir + "/one.txt")
+    let _ = fs.delete(dir + "/sub/two.txt")
+    let _ = fs.delete(dir + "/sub")
+    let _ = fs.delete(dir + "/.hidden/secret.txt")
+    let _ = fs.delete(dir + "/.hidden")
+    let _ = fs.delete(dir)
+    ()
+
+@test
+fn test_every_kind_has_a_name_and_a_plain_form() [io]
+    test.case("the nine kinds of an event, as words")
+    test.assert(wtevent.kind_name(WtCreated) == "created")
+    test.assert(wtevent.kind_name(WtModified) == "modified")
+    test.assert(wtevent.kind_name(WtMetadata) == "metadata")
+    test.assert(wtevent.kind_name(WtRemoved) == "removed")
+    test.assert(wtevent.kind_name(WtRenamed("a", "b")) == "renamed")
+    test.assert(wtevent.kind_name(WtMovedOut) == "moved_out")
+    test.assert(wtevent.kind_name(WtMovedIn) == "moved_in")
+    test.assert(wtevent.kind_name(WtOverflow(0)) == "overflow")
+    test.assert(wtevent.kind_name(WtWatchLost("a")) == "watch_lost")
+
+    test.case("and the kind a raw event becomes when it is no move half")
+    test.assert(wtevent.kind_name(wtevent.plain_kind(WtRawCreated)) == "created")
+    test.assert(wtevent.kind_name(wtevent.plain_kind(WtRawModified)) == "modified")
+    test.assert(wtevent.kind_name(wtevent.plain_kind(WtRawMetadata)) == "metadata")
+    test.assert(wtevent.kind_name(wtevent.plain_kind(WtRawRemoved)) == "removed")
+    test.assert(wtevent.kind_name(wtevent.plain_kind(WtRawMovedFrom)) == "moved_out")
+    test.assert(wtevent.kind_name(wtevent.plain_kind(WtRawMovedTo)) == "moved_in")
+    test.assert(wtevent.kind_name(wtevent.plain_kind(WtRawOverflow)) == "overflow")
+    test.assert(wtevent.kind_name(wtevent.plain_kind(WtRawWatchLost)) == "watch_lost")
+
+@test
+fn test_a_move_to_with_no_partner_lands_at_its_own_edge() [io]
+    let (events, pairing) = wtevent.pair(wtevent.default_pairing(),
+                                        [wtevent.raw(WtRawMovedTo, "b.nv", false, 9, 1)], 100.0)
+
+    test.case("a half of a rename with nothing to pair with is a move in")
+    test.assert(list.len(events) == 1)
+    test.assert(wtevent.kind_name(events[0].kind) == "moved_in")
+    test.assert(events[0].path == "b.nv")
+
+    test.case("and nothing is left waiting for a partner that never comes")
+    test.assert(wtevent.pending_count(pairing) == 0)
+
+@test
+fn test_an_inotify_buffer_is_read_record_by_record() [io]
+    let buf = bytes.concat([
+        record(1, wtinotify.in_queue_overflow, 0, ""),
+        record(1, wtinotify.in_unmount, 0, ""),
+        record(1, wtinotify.in_ignored, 0, ""),
+        record(1, wtinotify.in_delete_self, 0, ""),
+        record(1, wtinotify.in_move_self, 0, ""),
+        record(3, wtinotify.in_create | wtinotify.in_isdir, 0, "sub"),
+        record(3, wtinotify.in_delete, 0, "gone.txt"),
+        record(3, wtinotify.in_moved_from, 9, "a.txt"),
+        record(3, wtinotify.in_moved_to, 9, "b.txt"),
+        record(3, wtinotify.in_modify, 0, "m.txt"),
+        record(3, wtinotify.in_attrib, 0, "p.txt"),
+        record(3, 1, 0, "read.txt"),
+        record(3, wtinotify.in_modify, 0, "0123456789abcdef")])
+
+    let (events, dropped) = wtinotify.raw_events(buf)
+
+    test.case("the record a kernel sends when its queue overflowed")
+    test.assert(list.len(events) == 12)
+    test.assert(events[0].kind == WtRawOverflow)
+    test.assert(events[0].path == "")
+    test.assert(events[0].watch_id == 0)
+    test.assert(dropped)
+
+    test.case("the four self events, each a watch that is gone")
+    test.assert(events[1].kind == WtRawWatchLost)
+    test.assert(events[2].kind == WtRawWatchLost)
+    test.assert(events[3].kind == WtRawWatchLost)
+    test.assert(events[4].kind == WtRawWatchLost)
+    test.assert(events[1].is_directory)
+    test.assert(events[1].watch_id == 1)
+
+    test.case("a creation of a directory keeps the name and the directory bit")
+    test.assert(events[5].kind == WtRawCreated)
+    test.assert(events[5].path == "sub")
+    test.assert(events[5].is_directory)
+    test.assert(events[5].watch_id == 3)
+
+    test.case("a removal, named in the record")
+    test.assert(events[6].kind == WtRawRemoved)
+    test.assert(events[6].path == "gone.txt")
+
+    test.case("the two halves of a rename, tied by the kernel's cookie")
+    test.assert(events[7].kind == WtRawMovedFrom)
+    test.assert(events[7].cookie == 9)
+    test.assert(events[8].kind == WtRawMovedTo)
+    test.assert(events[8].path == "b.txt")
+
+    test.case("a modification and a metadata change")
+    test.assert(events[9].kind == WtRawModified)
+    test.assert(events[10].kind == WtRawMetadata)
+
+    test.case("a mask with no kind this package names is left out")
+    test.assert(events[11].path == "0123456789abcdef")
+
+    test.case("a name of sixteen bytes is padded to a thirty-two byte field")
+    test.assert(events[11].kind == WtRawModified)
+
+    test.case("a buffer that was read to its last byte may have more behind it")
+    test.assert(not wtinotify.poll_of(buf, bytes.len(buf)).timed_out)
+    test.assert(wtinotify.poll_of(buf, bytes.len(buf) + 8).timed_out)
+
+    test.case("a buffer with no overflow in it says so")
+    let (_, clean) = wtinotify.raw_events(record(3, wtinotify.in_modify, 0, "m.txt"))
+    test.assert(not clean)
+
+@test
+fn test_the_poller_refuses_a_root_it_cannot_read() [io, fs]
+    let dir = fs.temp_dir()
+    let file = dir + "/a-file"
+    let _ = fs.write(file, "text")
+    let missing = wtpoll.poller(dir + "/not-there", wtfilter.everything(), 0)
+
+    test.case("a root that is not there is not a tree to scan")
+    match wtpoll.scan(missing, 0.0)
+        Err(f) => test.assert(str.starts_with(f.message(), "there is no such path to watch: "))
+        Ok(_)  => test.fail("a scan of a root that is not there answered a snapshot")
+
+    test.case("and a poller refuses a watch on it before placing anything")
+    match missing.watch(dir + "/not-there")
+        Err(f) => test.assert(str.starts_with(f.message(), "there is no such path to watch: "))
+        Ok(_)  => test.fail("a poller accepted a watch on a path that is not there")
+
+    test.case("a root that is a file is not a tree either")
+    match wtpoll.scan(wtpoll.poller(file, wtfilter.everything(), 0), 0.0)
+        Err(f) => test.assert(f.message() == "the watch backend failed: the watch root is not a directory")
+        Ok(_)  => test.fail("a scan of a file answered a snapshot")
+
+    test.case("the three numbers a scan reads for one path")
+    let entry = wtpoll.stat_entry(file, false)
+    test.assert(entry.path == file)
+    test.assert(entry.size == 4)
+    test.assert(not entry.is_directory)
+
+    test.case("a child path keeps the spelling of the root it hangs from")
+    test.assert(wtpoll.join_path(".", "x") == "x")
+    test.assert(wtpoll.join_path("", "x") == "x")
+    test.assert(wtpoll.join_path("src", "x") == "src/x")
+
+    let _ = fs.delete(file)
+    let _ = fs.delete(dir)
+
+@test
+fn test_the_poller_walks_a_tree_and_stops_at_its_cap() [io, fs]
+    let dir = fs.temp_dir()
+    let _ = fs.write(dir + "/one.txt", "one")
+    let _ = fs.mkdir(dir + "/sub")
+    let _ = fs.write(dir + "/sub/two.txt", "two")
+    let _ = fs.mkdir(dir + "/.hidden")
+    let _ = fs.write(dir + "/.hidden/secret.txt", "secret")
+
+    let p = wtpoll.bounded(wtpoll.poller(dir, wtfilter.everything(), 0), 8, 200)
+
+    test.case("the tree, in path order, with the hidden directory left out")
+    match wtpoll.scan(p, 5.0)
+        Ok(s)  =>
+            test.assert(s.root == dir)
+            test.assert(not s.truncated)
+            test.assert(list.len(s.entries) == 3)
+            test.assert(s.entries[0].path == dir + "/one.txt")
+            test.assert(s.entries[1].path == dir + "/sub")
+            test.assert(s.entries[1].is_directory)
+            test.assert(s.entries[2].path == dir + "/sub/two.txt")
+            test.assert(s.entries[2].size == 3)
+        Err(f) =>
+            test.fail("the scan of a tree that is there answered a fault")
+
+    test.case("a poll over the whole tree reports every path as created")
+    match p.poll(1.0)
+        Ok(full) =>
+            test.assert(full.timed_out)
+            test.assert(list.len(full.events) == 3)
+            test.assert(full.events[0].kind == WtRawCreated)
+            test.assert(full.events[0].watch_id == 0)
+        Err(f)   =>
+            test.fail("the poll of a tree that is there answered a fault")
+
+    test.case("a poll with no time to spare reads one entry and says so")
+    match p.poll(0.0)
+        Ok(narrow) =>
+            test.assert(not narrow.timed_out)
+            test.assert(list.len(narrow.events) == 1)
+        Err(f)     =>
+            test.fail("a poll with a zero deadline answered a fault")
+
+    test.case("an entry bound stops the walk where the bound is reached")
+    match wtpoll.bounded(p, 8, 1).poll(1.0)
+        Ok(capped) =>
+            test.assert(not capped.timed_out)
+            test.assert(list.len(capped.events) == 1)
+        Err(f)     =>
+            test.fail("a bounded poll answered a fault")
+
+    test.case("a depth bound above the root reads nothing and reports it")
+    match wtpoll.bounded(p, -1, 200).poll(1.0)
+        Ok(shallow) =>
+            test.assert(list.len(shallow.events) == 0)
+            test.assert(not shallow.timed_out)
+        Err(f)      =>
+            test.fail("a poll bounded above the root answered a fault")
+
+    test.case("a cap reached inside a child stops the parent too")
+    let _ = fs.mkdir(dir + "/cap")
+    let _ = fs.mkdir(dir + "/cap/leaf")
+    let _ = fs.write(dir + "/cap/leaf/deep.txt", "deep")
+    match wtpoll.bounded(wtpoll.poller(dir + "/cap", wtfilter.everything(), 0), 8, 1).poll(1.0)
+        Ok(nested) =>
+            test.assert(not nested.timed_out)
+            test.assert(list.len(nested.events) == 1)
+        Err(f)     =>
+            test.fail("a poll of a two-level tree answered a fault")
+
+    test.case("a poller accepts a watch, forgets one and closes")
+    match p.watch(dir)
+        Ok(id) => test.assert(id == 0)
+        Err(f) => test.fail("a poller refused a directory that is there")
+    match p.unwatch(3)
+        Ok(_)  => test.assert(p.max_entries == 200)
+        Err(f) => test.fail("a poller refused to forget a watch it never placed")
+    match p.close()
+        Ok(_)  => test.assert(p.max_depth == 8)
+        Err(f) => test.fail("a poller refused to close")
+
+    let _ = fs.delete(dir + "/cap/leaf/deep.txt")
+    let _ = fs.delete(dir + "/cap/leaf")
+    let _ = fs.delete(dir + "/cap")
+    remove_tree(dir)
+
+@test
+fn test_a_comparison_event_reports_as_a_raw_kind() [io]
+    test.assert(wtpoll.raw_kind(WtCreated) == WtRawCreated)
+    test.assert(wtpoll.raw_kind(WtModified) == WtRawModified)
+    test.assert(wtpoll.raw_kind(WtMetadata) == WtRawMetadata)
+    test.assert(wtpoll.raw_kind(WtRemoved) == WtRawRemoved)
+    test.assert(wtpoll.raw_kind(WtMovedOut) == WtRawMovedFrom)
+    test.assert(wtpoll.raw_kind(WtMovedIn) == WtRawMovedTo)
+    test.assert(wtpoll.raw_kind(WtOverflow(0)) == WtRawOverflow)
+    test.assert(wtpoll.raw_kind(WtWatchLost("a")) == WtRawWatchLost)
+    test.assert(wtpoll.raw_kind(WtRenamed("a", "b")) == WtRawModified)
+
+@test
+fn test_a_partial_snapshot_is_never_compared() [io]
+    let a = wtpoll.entry("a.txt", false, 10, 10, 0, 33188)
+    let b = wtpoll.entry("b.txt", false, 20, 10, 0, 33188)
+    let before = wtpoll.snapshot(".", [b], 100.0)
+    let after = wtpoll.snapshot(".", [a, b], 100.0)
+    let partial = WtSnapshot { root: ".", entries: [b], at_unix: 100.0, truncated: true }
+
+    test.case("a partial snapshot on the before side would report a deletion")
+    test.assert(list.len(wtpoll.diff_snapshots(partial, after)) == 0)
+
+    test.case("a path only the after side has is a creation")
+    let created = wtpoll.diff_snapshots(before, after)
+    test.assert(list.len(created) == 1)
+    test.assert(created[0].path == "a.txt")
+    test.assert(wtevent.kind_name(created[0].kind) == "created")
+
+    test.case("and a path only the before side has is a removal")
+    let removed = wtpoll.diff_snapshots(after, before)
+    test.assert(list.len(removed) == 1)
+    test.assert(removed[0].path == "a.txt")
+    test.assert(wtevent.kind_name(removed[0].kind) == "removed")
+
+    test.case("a file written inside the scan's own second is the unsure one")
+    let recent = wtpoll.snapshot(".", [wtpoll.entry("a.txt", false, 10, 100, 0, 33188)], 100.5)
+    let unsure = wtpoll.rehash_suspicious(recent, recent)
+    test.assert(list.len(unsure) == 1)
+    test.assert(unsure[0] == "a.txt")
+
+    test.case("a path on one side only is not a file a stat cannot settle")
+    test.assert(list.len(wtpoll.rehash_suspicious(before, after)) == 0)
+    test.assert(list.len(wtpoll.rehash_suspicious(after, before)) == 0)
+
+@test
+fn test_the_filter_decides_before_a_watch_is_placed() [io]
+    test.case("a directory whose name is hidden is not descended into")
+    test.assert(not wtfilter.may_descend(wtfilter.everything(), ".git"))
+    test.assert(not wtfilter.may_descend(wtfilter.everything(), "src/.cache"))
+
+    test.case("unless the filter was asked for hidden paths as well")
+    test.assert(wtfilter.may_descend(wtfilter.with_hidden(wtfilter.everything()), ".git"))
+
+    test.case("a pattern that will never match anything is reported either way")
+    test.assert(list.len(wtfilter.invalid_patterns(wtfilter.filter([], ["[unclosed"]))) == 1)
+    test.assert(list.len(wtfilter.invalid_patterns(wtfilter.filter(["[unclosed"], []))) == 1)
+    test.assert(list.len(wtfilter.invalid_patterns(wtfilter.filter(["src/**/*.nv"], []))) == 0)
+
+@test
+fn test_a_folded_event_keeps_the_entry_it_replaced() [io]
+    let d = wtdebounce.debounce(1.0, 10.0)
+    let (_, two) = wtdebounce.feed(d, [wtevent.event(WtModified, "a.nv", false, 0.0, 1),
+                                       wtevent.event(WtModified, "b.nv", false, 0.0, 1)],
+                                       0.0)
+
+    test.case("two paths are two entries")
+    test.assert(wtdebounce.pending_count(two) == 2)
+
+    let (_, folded) = wtdebounce.feed(two, [wtevent.event(WtModified, "a.nv", false, 0.0, 1)], 0.1)
+
+    test.case("folding into one path leaves the other entry where it was")
+    test.assert(wtdebounce.pending_count(folded) == 2)
+    match wtdebounce.pending_for(folded, "b.nv")
+        Some(p) => test.assert(p.folded == 1)
+        None    => test.fail("the entry that was not folded into was dropped")
+
+    test.case("and a path that is not waiting answers nothing")
+    match wtdebounce.pending_for(folded, "c.nv")
+        None    => test.assert(wtdebounce.pending_count(folded) == 2)
+        Some(_) => test.fail("a path that was never fed answered a pending entry")
+
+    test.case("a path folded past the cap is due at the cap, not at quiet")
+    let capped = wtdebounce.debounce(10.0, 5.0)
+    let (_, first) = wtdebounce.feed(capped, [wtevent.event(WtModified, "a.nv", false, 0.0, 1)], 0.0)
+    let (_, second) = wtdebounce.feed(first, [wtevent.event(WtModified, "a.nv", false, 0.0, 1)], 3.0)
+    match wtdebounce.next_deadline(second)
+        Some(at) => test.assert(at == 5.0)
+        None     => test.fail("an entry that is still waiting answered no deadline")
+
+    test.case("with two entries waiting, the deadline is the earlier one")
+    let paced = wtdebounce.debounce(2.0, 100.0)
+    let (_, one) = wtdebounce.feed(paced, [wtevent.event(WtModified, "a.nv", false, 0.0, 1)], 0.0)
+    let (_, two) = wtdebounce.feed(one, [wtevent.event(WtModified, "b.nv", false, 0.0, 1)], 1.0)
+    match wtdebounce.next_deadline(two)
+        Some(at) => test.assert(at == 2.0)
+        None     => test.fail("two entries that are waiting answered no deadline")
+
+@test
+fn test_a_tree_records_what_it_placed_and_what_it_skipped() [io]
+    let slot = ptr.alloc_word()
+    let good = wtwatch.watch_tree(ScriptBackend { slot: slot, mode: answers_watches },
+                                  "src", wtfilter.everything(), 64)
+
+    test.case("a watch the backend answered is recorded with its path")
+    test.assert(wtwatch.watch_count(good) == 1)
+    match wtwatch.watch_of(good, 99)
+        Some(w) =>
+            test.assert(w.path == "src")
+            test.assert(w.recursive_root)
+        None    => test.fail("a tree that holds this watch answered nothing for its id")
+    match wtwatch.watch_of(good, 4)
+        None    => test.assert(wtwatch.watch_count(good) == 1)
+        Some(_) => test.fail("a tree answered a watch for an id it does not hold")
+
+    test.case("a directory the filter will not descend into is reported, not placed")
+    let skipped = wtwatch.watch_tree(ScriptBackend { slot: slot, mode: answers_watches },
+                                    ".git", wtfilter.everything(), 64)
+    test.assert(wtwatch.watch_count(skipped) == 0)
+    test.assert(list.len(skipped.skipped) == 1)
+    test.assert(skipped.skipped[0] == ".git")
+
+    test.case("a watch the backend refused comes back as a fault beside the rest")
+    let refused = wtwatch.watch_tree(ScriptBackend { slot: slot, mode: refuses_watches },
+                                    "src", wtfilter.everything(), 64)
+    test.assert(wtwatch.watch_count(refused) == 0)
+    test.assert(list.len(refused.faults) == 1)
+
+    test.case("a tree whose removals answer gives back no fault")
+    test.assert(list.len(wtwatch.unwatch_tree(ScriptBackend { slot: slot, mode: answers_watches },
+                                             good)) == 0)
+
+    test.case("and one whose removals fail gives back each of them")
+    let failing = wtwatch.watch_tree(ScriptBackend { slot: slot, mode: refuses_removals },
+                                     "src", wtfilter.everything(), 64)
+    test.assert(wtwatch.watch_count(failing) == 1)
+    test.assert(list.len(wtwatch.unwatch_tree(ScriptBackend { slot: slot, mode: refuses_removals },
+                                              failing)) == 1)
+
+    test.case("a replay backend accepts a watch and a removal without anything")
+    match wtwatch.replay_backend(3).watch("src")
+        Ok(id) => test.assert(id == 0)
+        Err(f) => test.fail("a replay backend refused a watch")
+    match wtwatch.replay_backend(3).unwatch(1)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("a replay backend refused to forget a watch it never placed")
+
+@test
+fn test_the_fault_a_backend_answers_says_what_to_do() [io]
+    test.case("a filesystem that will not signal is the one to poll instead")
+    test.assert(wtwatch.WtUnsupportedFilesystem("a network mount").message() == "this filesystem does not support watching: a network mount")
+    test.assert(wtwatch.suggests_polling(wtwatch.WtUnsupportedFilesystem("net")))
+    test.assert(wtwatch.suggests_polling(wtwatch.WtWatchLimit(8192)))
+    test.assert(wtwatch.suggests_polling(wtwatch.WtInstanceLimit(128)))
+
+    test.case("the faults a different directory would not have fixed do not")
+    test.assert(not wtwatch.suggests_polling(wtwatch.WtNotFound("src")))
+    test.assert(not wtwatch.suggests_polling(wtwatch.WtPermissionDenied("src")))
+    test.assert(not wtwatch.suggests_polling(wtwatch.WtClosed))
+    test.assert(not wtwatch.suggests_polling(wtwatch.WtBackendFailed("inotify_add_watch failed")))
+
+@test
+fn test_a_whole_watch_session_runs_over_a_scripted_backend() [io, time]
+    let cfg = wtloop.with_poll_interval(
+                  wtloop.with_debounce(wtloop.config(wtfilter.everything()),
+                                       wtdebounce.debounce(0.0, 1.0)),
+                  0.0)
+
+    test.case("the action is run at the start, then once per batch, until it stops")
+    match wtloop.run_on_change(ScriptBackend { slot: ptr.alloc_word(), mode: refuses_watches },
+                               ".", cfg, stop_when_told)
+        Ok(turns) => test.assert(turns == 2)
+        Err(f)    => test.fail("a session the action ended answered a fault")
+
+    test.case("a session still running and told to stop raises the first fault it met")
+    match wtloop.start(ScriptBackend { slot: ptr.alloc_word(), mode: refuses_removals },
+                       ".", wtloop.config(wtfilter.everything()))
+        Ok(state) =>
+            test.assert(wtwatch.watch_count(state.tree) == 1)
+            match wtloop.stop(ScriptBackend { slot: ptr.alloc_word(), mode: refuses_removals }, state)
+                Err(f) => test.assert(f.message() == "the watch backend was closed")
+                Ok(_)  => test.fail("a session whose removals failed ended cleanly")
+        Err(f)    =>
+            test.fail("a session that places a watch answered a fault")
+
+@test
+fn test_the_loop_waits_for_the_shorter_of_two_deadlines() [io, time]
+    let cfg = wtloop.config(wtfilter.everything())
+    let (_, waiting) = wtdebounce.feed(wtdebounce.debounce(1.0, 10.0),
+                                       [wtevent.event(WtModified, "a.nv", false, 0.0, 1)], 100.0)
+
+    match wtloop.start(ScriptBackend { slot: ptr.alloc_word(), mode: answers_watches }, ".", cfg)
+        Ok(started) =>
+            test.case("the clock is the one row in this package that reads it")
+            test.assert(wtloop.now_unix() > 0.0)
+
+            test.case("a deadline inside the poll interval is the one to wait for")
+            let state = WtLoopState { config: cfg, tree: started.tree, debounce: waiting,
+                                      pairing: started.pairing, root: ".", turns: 0 }
+            test.assert_approx(wtloop.wait_seconds(state, 100.25), 0.75, 0.0000001)
+
+            test.case("a deadline that has already passed is no wait at all")
+            test.assert(wtloop.wait_seconds(state, 200.0) == 0.0)
+
+            test.case("and a poll interval shorter than the deadline is what is left")
+            let quick = WtLoopState { config: wtloop.with_poll_interval(cfg, 0.1),
+                                      tree: started.tree, debounce: waiting,
+                                      pairing: started.pairing, root: ".", turns: 0 }
+            test.assert(wtloop.wait_seconds(quick, 100.25) == 0.1)
+
+            test.case("a debouncer with nothing waiting waits the poll interval")
+            let empty = WtLoopState { config: cfg, tree: started.tree,
+                                      debounce: wtdebounce.default_debounce(),
+                                      pairing: started.pairing, root: ".", turns: 0 }
+            test.assert(wtloop.wait_seconds(empty, 100.2) == 1.0)
+
+        Err(f)      =>
+            test.fail("a session that places a watch answered a fault")
+
+@test
+fn test_a_turn_says_what_it_did_in_one_line() [io]
+    test.case("an action that ran is counted, with its events")
+    test.assert(wtloop.describe_turn(WtTurn { events: [wtevent.event(WtCreated, "a", false, 0.0, 1)],
+                                              acted: true, rescanned: false, watches_added: 0,
+                                              faults: [] }) == "acted on 1 event")
+    test.assert(wtloop.describe_turn(WtTurn { events: [wtevent.event(WtCreated, "a", false, 0.0, 1),
+                                                       wtevent.event(WtCreated, "b", false, 0.0, 1)],
+                                              acted: true, rescanned: false, watches_added: 0,
+                                              faults: [] }) == "acted on 2 events")
+
+    test.case("a turn that re-placed the watches says so")
+    test.assert(wtloop.describe_turn(WtTurn { events: [], acted: false, rescanned: true,
+                                              watches_added: 0,
+                                              faults: [] }) == "rescanned: the watches were placed again")
+
+    test.case("a turn that added watches counts them, singular or plural")
+    test.assert(wtloop.describe_turn(WtTurn { events: [], acted: false, rescanned: false,
+                                              watches_added: 1, faults: [] }) == "added 1 watch")
+    test.assert(wtloop.describe_turn(WtTurn { events: [], acted: false, rescanned: false,
+                                              watches_added: 3, faults: [] }) == "added 3 watches")
+
+    test.case("a turn that carried faults counts those too")
+    test.assert(wtloop.describe_turn(WtTurn { events: [], acted: false, rescanned: false,
+                                              watches_added: 0, faults: [WtClosed, WtClosed] }) == "carried 2 faults")
+
+    test.case("and a turn that did nothing says that rather than nothing")
+    test.assert(wtloop.describe_turn(WtTurn { events: [], acted: false, rescanned: false,
+                                              watches_added: 0, faults: [] }) == "nothing to report")
+
+@test
+fn test_every_errno_maps_to_the_fault_it_means() [io, fs]
+    test.case("a watch that could not be placed, by the errno the kernel left")
+    test.assert(wtinotify.watch_fault("p", wtinotify.E_NOENT).message() == "there is no such path to watch: p")
+    test.assert(wtinotify.watch_fault("p", wtinotify.E_ACCES).message() == "this process may not watch: p")
+    test.assert(wtinotify.watch_fault("p", wtinotify.E_PERM).message() == "this process may not watch: p")
+    test.assert(wtinotify.watch_fault("p", wtinotify.E_NOSPC).message() == "the per-user watch limit is reached at 0 watches")
+    test.assert(wtinotify.watch_fault("p", wtinotify.E_MFILE).message() == "too many inotify instances in this process: the limit is 0")
+    test.assert(wtinotify.watch_fault("p", wtinotify.E_FILE).message() == "too many inotify instances in this process: the limit is 0")
+    test.assert(wtinotify.watch_fault("p", wtinotify.E_NOSYS).message() == "this filesystem does not support watching: p")
+    test.assert(wtinotify.watch_fault("p", wtinotify.E_NOTSUP).message() == "this filesystem does not support watching: p")
+    test.assert(wtinotify.watch_fault("p", wtinotify.E_INVAL).message() == "the watch backend failed: the path is not a directory: p")
+    test.assert(wtinotify.watch_fault("p", wtinotify.E_BADF).message() == "the watch backend was closed")
+    test.assert(wtinotify.watch_fault("p", 999).message() == "the watch backend failed: inotify_add_watch failed with errno 999")
+
+    test.case("and an instance that could not be opened")
+    test.assert(wtinotify.instance_fault(wtinotify.E_MFILE).message() == "too many inotify instances in this process: the limit is 0")
+    test.assert(wtinotify.instance_fault(wtinotify.E_FILE).message() == "too many inotify instances in this process: the limit is 0")
+    test.assert(wtinotify.instance_fault(wtinotify.E_NOSYS).message() == "this filesystem does not support watching: inotify")
+    test.assert(wtinotify.instance_fault(wtinotify.E_NOTSUP).message() == "this filesystem does not support watching: inotify")
+    test.assert(wtinotify.instance_fault(999).message() == "the watch backend failed: inotify_init1 failed with errno 999")
+
+    test.case("a limit read from /proc, and the three ways that read fails")
+    match wtinotify.limits_from_proc()
+        Ok(l)  =>
+            test.assert(l.max_user_watches > 0)
+            test.assert(l.max_user_instances > 0)
+            test.assert(l.max_queued_events > 0)
+            test.assert(wtinotify.fits(l, 1))
+        Err(f) =>
+            test.fail("this machine publishes the inotify limits and this read did not find them")
+
+    test.assert(wtinotify.default_limits().max_queued_events == 16384)
+    test.assert(wtinotify.raise_limit_hint(524288) == "fs.inotify.max_user_watches=524288")
+    test.assert(list.len(wtinotify.known_blind_spots()) == 3)
+
+    let dir = fs.temp_dir()
+    let worded = dir + "/worded"
+    let _ = fs.write(worded, "not a number")
+    match wtinotify.proc_number(worded)
+        Err(f) => test.assert(f.message() == "the watch backend failed: not a number in " + worded)
+        Ok(_)  => test.fail("a file of text answered a number")
+    match wtinotify.proc_number(dir + "/not-there")
+        Err(f) => test.assert(f.message() == "the watch backend failed: could not read " + dir + "/not-there")
+        Ok(_)  => test.fail("a file that is not there answered a number")
+    match wtinotify.proc_number("/proc/sys/fs/inotify/max_user_watches")
+        Ok(n)  => test.assert(n > 0)
+        Err(f) => test.fail("this machine publishes the inotify watch limit and this read did not find it")
+
+    let _ = fs.delete(worded)
+    let _ = fs.delete(dir)
+
+@test
+fn test_an_inotify_watcher_reports_a_real_directory() [io, fs]
+    let dir = fs.temp_dir()
+
+    match wtinotify.open()
+        Err(f) =>
+            test.fail("a kernel without inotify is not the machine this suite runs on")
+        Ok(w)  =>
+            test.assert(wtinotify.buffer_size(w) == 65536)
+            test.assert(wtinotify.watches_held(w) == 0)
+            test.assert(wtinotify.is_available())
+            test.assert(wtinotify.watch_id_of(4294967295) == 0)
+            test.assert(wtinotify.watch_id_of(3) == 3)
+
+            test.case("a read buffer too small to hold a deep name is refused")
+            match wtinotify.open_with(100)
+                Err(f) => test.assert(f.message() == "the watch backend failed: a read buffer under 4096 bytes answers EINVAL on a deep path")
+                Ok(_)  => test.fail("a read buffer too small to hold a name was accepted")
+
+            test.case("an idle watcher waits out its deadline and says so")
+            match w.poll(0.0)
+                Ok(idle) => test.assert(idle.timed_out)
+                Err(f)   => test.fail("a poll of an idle watcher answered a fault")
+
+            test.case("and a deadline below zero is a wait of no time at all")
+            match w.poll(-1.0)
+                Ok(idle) => test.assert(idle.timed_out)
+                Err(f)   => test.fail("a poll with a negative deadline answered a fault")
+
+            test.case("the paths a watch cannot be placed on, named one by one")
+            match w.watch(dir + "/not-there")
+                Err(f) => test.assert(f.message() == "there is no such path to watch: " + dir + "/not-there")
+                Ok(_)  => test.fail("a watch was placed on a path that is not there")
+
+            let _ = fs.write(dir + "/alpha.txt", "alpha")
+            match w.watch(dir + "/alpha.txt")
+                Err(f) => test.assert(str.starts_with(f.message(), "the watch backend failed: inotify_add_watch failed with errno "))
+                Ok(_)  => test.fail("a watch was placed on a file")
+
+            test.case("a directory this process may not read is refused, unless it may")
+            let _ = fs.mkdir(dir + "/locked")
+            let _ = fs.set_file_mode(dir + "/locked", 0)
+            match w.watch(dir + "/locked")
+                Err(f) => test.assert(f.message() == "this process may not watch: " + dir + "/locked")
+                Ok(_)  => test.assert(fs.is_dir(dir + "/locked"))
+
+            test.case("the write of a new file is reported under its own name")
+            match w.watch(dir)
+                Ok(id) =>
+                    test.assert(id > 0)
+                    let _ = fs.write(dir + "/beta.txt", "beta")
+                    match w.poll(2.0)
+                        Ok(first) =>
+                            test.assert(first.timed_out)
+                            test.assert(count_of(WtRawCreated, "beta.txt", first.events) == 1)
+                            test.assert(count_of(WtRawModified, "beta.txt", first.events) == 1)
+                        Err(f)    =>
+                            test.fail("a poll of a directory that changed answered a fault")
+
+                    test.case("a rename is two records tied by one cookie")
+                    let _ = fs.rename(dir + "/beta.txt", dir + "/gamma.txt")
+                    match w.poll(2.0)
+                        Ok(second) =>
+                            let from = cookie_of(WtRawMovedFrom, "beta.txt", second.events)
+                            let to = cookie_of(WtRawMovedTo, "gamma.txt", second.events)
+                            test.assert(from != 0)
+                            test.assert(from == to)
+                        Err(f)     =>
+                            test.fail("a poll after a rename answered a fault")
+
+                    test.case("a new directory is reported with the directory bit")
+                    let _ = fs.mkdir(dir + "/sub")
+                    match w.poll(2.0)
+                        Ok(third) =>
+                            var created_directory = false
+                            for e in third.events
+                                if e.kind == WtRawCreated and e.path == "sub" and e.is_directory
+                                    created_directory = true
+                            test.assert(created_directory)
+                        Err(f)    =>
+                            test.fail("a poll after a mkdir answered a fault")
+
+                    test.case("a watched directory that is removed is a watch that is gone")
+                    match w.watch(dir + "/sub")
+                        Ok(sub) =>
+                            let _ = fs.delete(dir + "/sub")
+                            match w.poll(2.0)
+                                Ok(fourth) =>
+                                    test.assert(lost_watch_id(fourth.events) == sub)
+                                    test.assert(count_of(WtRawRemoved, "sub", fourth.events) == 1)
+                                Err(f)     =>
+                                    test.fail("a poll after an rmdir answered a fault")
+                            match w.unwatch(sub)
+                                Ok(_)  => test.assert(wtinotify.watches_held(w) == 0)
+                                Err(f) => test.fail("a watch the kernel had already removed was reported as a fault")
+                        Err(f)  =>
+                            test.fail("a watch was not placed on a directory that is there")
+
+                    test.case("a watch removed twice is not a failure the second time")
+                    match w.unwatch(id)
+                        Ok(_)  => test.assert(wtinotify.watches_held(w) == 0)
+                        Err(f) => test.fail("a watch that was there was reported as unremovable")
+                    match w.unwatch(id)
+                        Ok(_)  => test.assert(wtinotify.watches_held(w) == 0)
+                        Err(f) => test.fail("a watch the kernel had already removed was reported as a fault")
+
+                    test.case("a closed watcher answers a poll with a wait that ended")
+                    match w.close()
+                        Ok(_)  => test.assert(wtinotify.buffer_size(w) == 65536)
+                        Err(f) => test.fail("a watcher that was open was reported as unclosable")
+                    match w.poll(0.0)
+                        Ok(closed) => test.assert(closed.timed_out)
+                        Err(f)     => test.assert(f.message() == "the watch backend was closed")
+                    match w.close()
+                        Err(f) => test.assert(f.message() == "the watch backend was closed")
+                        Ok(_)  => test.fail("a watcher that was already closed closed again")
+
+                    test.case("and a watch removed on a closed watcher is that same fault")
+                    match w.unwatch(id)
+                        Err(f) => test.assert(f.message() == "the watch backend was closed")
+                        Ok(_)  => test.fail("a closed watcher removed a watch")
+
+                Err(f) =>
+                    test.fail("a watch was not placed on the directory this test made")
+
+            let _ = fs.delete(dir + "/alpha.txt")
+            let _ = fs.delete(dir + "/gamma.txt")
+            let _ = fs.delete(dir + "/locked")
+
+    let _ = fs.delete(dir)

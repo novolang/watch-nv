@@ -1,8 +1,5 @@
 // wtinotify_tests.nv — the limits, which are the support questions.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: watch-nv.wtinotify.<fn>`.
-//
 // THE `fits` AND `raise_limit_hint` CASES ARE THE FILE'S POINT.  Every
 // person who has run a file watcher on a large repository has met "too
 // many open files" or a watcher that silently stopped noticing changes,
@@ -43,7 +40,7 @@ fn test_fits_is_asked_before_the_walk_rather_than_after_the_refusal() [io]
     test.assert(wtinotify.fits(l, 200))
 
     test.case("a repository with a build directory nobody excluded does not")
-    test.assert(wtinotify.fits(l, 200000) == false)
+    test.assert(not wtinotify.fits(l, 200000))
 
     test.case("and exactly the limit fits, because the limit is a maximum")
     test.assert(wtinotify.fits(l, 8192))

@@ -1,9 +1,6 @@
 // wtwatch_tests.nv — the trait, and the claim its effect parameter
 // makes.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: watch-nv.wtwatch.<fn>`.
-//
 // THE ASSERTION THE COMPILER MAKES is `place_tree` below: the whole
 // recursive walk declared `[]`, over the replay backend whose impl
 // supplies `[]`.  If the effect parameter did not do what this package
@@ -71,7 +68,7 @@ fn test_an_idle_poll_says_it_timed_out_rather_than_answering_empty() [io]
     test.assert(p.timed_out)
 
     test.case("with nothing lost")
-    test.assert(p.overflowed == false)
+    test.assert(not p.overflowed)
 
 @test
 fn test_a_limit_fault_names_the_number_an_operator_needs() [io]
@@ -91,10 +88,10 @@ fn test_the_three_faults_that_mean_fall_back_to_polling() [io]
     test.assert(wtwatch.suggests_polling(WtInstanceLimit(128)))
 
     test.case("a missing path is NOT — polling it would find nothing either")
-    test.assert(wtwatch.suggests_polling(WtNotFound("/nope")) == false)
+    test.assert(not wtwatch.suggests_polling(WtNotFound("/nope")))
 
     test.case("nor is a permission problem")
-    test.assert(wtwatch.suggests_polling(WtPermissionDenied("/root")) == false)
+    test.assert(not wtwatch.suggests_polling(WtPermissionDenied("/root")))
 
 @test
 fn test_every_fault_reads_as_something_different() [io]

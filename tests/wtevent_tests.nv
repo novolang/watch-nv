@@ -1,8 +1,5 @@
 // wtevent_tests.nv — the rename, and the two events nobody handles.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: watch-nv.wtevent.<fn>`.
-//
 // THE PAIRING CASES ARE WHY THE FILE EXISTS.  A rename arrives as two
 // events that may be split across reads and may never have a partner,
 // and a watcher that reported the halves makes every consumer pair them
@@ -92,8 +89,8 @@ fn test_an_overflow_demands_a_rescan_and_says_so() [io]
         wtevent.event(WtWatchLost("unmounted"), "", true, 0.0, 1)))
 
     test.case("and an ordinary change does not")
-    test.assert(wtevent.demands_rescan(
-        wtevent.event(WtModified, "a.nv", false, 0.0, 1)) == false)
+    test.assert(not wtevent.demands_rescan(
+        wtevent.event(WtModified, "a.nv", false, 0.0, 1)))
 
 @test
 fn test_appearance_and_disappearance_cover_the_arms_a_match_gets_wrong() [io]
@@ -111,8 +108,8 @@ fn test_appearance_and_disappearance_cover_the_arms_a_match_gets_wrong() [io]
     test.assert(wtevent.is_disappearance(renamed))
 
     test.case("and a modification is neither")
-    test.assert(wtevent.is_appearance(wtevent.event(WtModified, "a", false, 0.0, 1)) == false)
-    test.assert(wtevent.is_disappearance(wtevent.event(WtModified, "a", false, 0.0, 1)) == false)
+    test.assert(not wtevent.is_appearance(wtevent.event(WtModified, "a", false, 0.0, 1)))
+    test.assert(not wtevent.is_disappearance(wtevent.event(WtModified, "a", false, 0.0, 1)))
 
 @test
 fn test_an_ordinary_event_is_about_one_path() [io]

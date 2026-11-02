@@ -1,8 +1,5 @@
 // wtdebounce_tests.nv — the timing, tested without waiting.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: watch-nv.wtdebounce.<fn>`.
-//
 // EVERY CASE HERE WOULD BE A SLEEP IN AN ORDINARY TEST SUITE, and none
 // of them is one: the clock is an argument, so a burst at 0.0, 0.01 and
 // 0.02 that should emit at 0.32 is three calls and an assertion.  That
@@ -133,7 +130,7 @@ fn test_an_overflow_bypasses_the_debouncer() [io]
     test.assert(list.len(out) == 1)
 
     test.case("while an ordinary event does not bypass")
-    test.assert(wtdebounce.bypasses(modified("a")) == false)
+    test.assert(not wtdebounce.bypasses(modified("a")))
 
 @test
 fn test_the_next_deadline_is_what_turns_a_spin_into_a_sleep() [io]

@@ -1,8 +1,6 @@
 // wtinotify.nv — the Linux backend, and the four limits an operator
 // meets.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[io]` AND NOT `[fs]`.  An inotify watcher is a file descriptor: the
 // instance comes from `inotify_init1`, a watch from `inotify_add_watch`,
 // and events from `read` on the descriptor.  Nothing here opens a file
@@ -39,6 +37,7 @@
 // separately, which `wtevent.pair` puts back together.
 
 use wtevent
+use wtwatch
 
 // An inotify instance.
 //
@@ -49,9 +48,286 @@ pub struct WtInotify
     fd: Int
     buffer_bytes: Int
     // Whether the descriptor was opened non-blocking.  `poll` honours
-    // its deadline either way; this is what it uses to do so without a
-    // thread.
+    // its deadline either way.
     non_blocking: Bool
+
+// The C boundary, as five private shims.
+//
+// Nothing in the standard library makes a watch, so this backend reaches
+// the kernel through libc, which every program already links.  Each shim
+// declares `[ffi]`, because a body-less declaration is the whole
+// contract, and each call site below discharges it — which is what keeps
+// the public rows at the `[io]` this module's header argues for.
+@ffi(library = "c", symbol = "inotify_init1")
+fn c_inotify_init1(flags: i32) -> i32 [io, ffi]
+
+@ffi(library = "c", symbol = "inotify_add_watch")
+fn c_inotify_add_watch(fd: i32, file_path: Str, mask: u32) -> i32 [io, ffi]
+
+@ffi(library = "c", symbol = "inotify_rm_watch")
+fn c_inotify_rm_watch(fd: i32, wd: i32) -> i32 [io, ffi]
+
+@ffi(library = "c", symbol = "close")
+fn c_close(fd: i32) -> i32 [io, ffi]
+
+@ffi(library = "c", symbol = "__errno_location")
+fn c_errno_location() -> Int [io, ffi]
+
+// The `errno` values the calls above set, by the number Linux gives
+// them.
+//
+// The errno names are upper-case constants because a constant named in
+// a match pattern binds rather than compares when its name is lowercase:
+// the mappings below are `match` expressions on them.
+const E_PERM = 1
+const E_NOENT = 2
+const E_INTR = 4
+const E_BADF = 9
+const E_AGAIN = 11
+const E_ACCES = 13
+const E_INVAL = 22
+const E_FILE = 23
+const E_MFILE = 24
+const E_NOSPC = 28
+const E_NOSYS = 38
+const E_NOTSUP = 95
+
+// The two flags an instance is opened with.
+//
+// These are the `O_*` flags `inotify_init1` takes, not the `IN_*` mask
+// bits below, one of which happens to sit on the same bit: non-blocking,
+// so a read never waits past the deadline, and close-on-exec, so a child
+// process does not inherit the descriptor.
+let o_nonblock = 1 << 11
+let o_cloexec  = 1 << 19
+
+// The mask bits a watch is placed with, by position as the kernel numbers
+// them.
+let in_modify         = 1 << 1
+let in_attrib         = 1 << 2
+let in_moved_from     = 1 << 6
+let in_moved_to       = 1 << 7
+let in_create         = 1 << 8
+let in_delete         = 1 << 9
+let in_delete_self    = 1 << 10
+let in_move_self      = 1 << 11
+let in_unmount        = 1 << 13
+let in_queue_overflow = 1 << 14
+let in_ignored        = 1 << 15
+let in_onlydir        = 1 << 24
+let in_excl_unlink    = 1 << 26
+let in_isdir          = 1 << 30
+
+// The buffer an instance is opened with by default: 64 KB, which holds
+// some two thousand events at the deepest path a repository has.
+let default_buffer_bytes = 65536
+
+// The errno the last failed call left.
+//
+// Read through the libc accessor rather than through a saved copy,
+// because the value is per thread and the call that set it is the one
+// just made — `io.read_fd` between a failed call and this one would
+// clobber an arm that let anything run.
+fn errno_now() -> Int [io]
+    var e = 0
+    unsafe_discharge [ffi]
+        e = ptr.read_i32(c_errno_location())
+    e
+
+// The flags `inotify_init1` is called with.
+fn open_flags() -> Int
+    o_nonblock | o_cloexec
+
+// The mask every watch is placed with.
+//
+// Create, delete, modify, attrib and both halves of a move; the two self
+// events, so a watch that died is reported rather than silently gone;
+// and the two flags that make the watch honest — `IN_ONLYDIR`, so a path
+// that is a file is refused instead of watched uselessly, and
+// `IN_EXCL_UNLINK`, so the events for an unlinked file stop.
+fn watch_mask() -> Int
+    var mask = in_create | in_delete | in_modify | in_attrib
+    mask = mask | in_moved_from | in_moved_to
+    mask = mask | in_delete_self | in_move_self
+    mask | in_onlydir | in_excl_unlink
+
+// A record's watch id, or zero for the one descriptor that is not a
+// watch.
+//
+// The kernel reports a queue overflow with a descriptor of -1, which is
+// read here as its unsigned 32-bit self; a watch id is how a caller
+// looks its watch up, and an overflow has none to look up.
+fn watch_id_of(wd: Int) -> Int
+    if wd > 2147483647
+        0
+    else
+        wd
+
+// Why a watch could not be placed, from the errno the kernel left.
+//
+// Every arm is a different conversation with an operator: a missing
+// path, a permission, the watch limit, the instance limit and a
+// filesystem that will not signal are five different remedies, which is
+// what the fault type exists to keep apart.  The two limits carry `0`
+// for the number, the same way a dropped-event count does, because the
+// kernel states the limit in `/proc` and not in the error.
+fn watch_fault(file_path: Str, e: Int) -> WtFault
+    match e
+        E_NOENT            => WtNotFound(file_path)
+        E_ACCES | E_PERM   => WtPermissionDenied(file_path)
+        E_NOSPC            => WtWatchLimit(0)
+        E_MFILE | E_FILE   => WtInstanceLimit(0)
+        E_NOSYS | E_NOTSUP => WtUnsupportedFilesystem(file_path)
+        E_INVAL            => WtBackendFailed("the path is not a directory: " + file_path)
+        E_BADF             => WtClosed
+        _                  => WtBackendFailed("inotify_add_watch failed with errno " + str.from_int(e))
+
+// Why an instance could not be opened, from the errno the kernel left.
+//
+// The instance limit is the one fault a kernel reports here that has a
+// remedy, and the only one whose remedy is not the polling backend.
+fn instance_fault(e: Int) -> WtFault
+    match e
+        E_MFILE | E_FILE   => WtInstanceLimit(0)
+        E_NOSYS | E_NOTSUP => WtUnsupportedFilesystem("inotify")
+        _                  => WtBackendFailed("inotify_init1 failed with errno " + str.from_int(e))
+
+// One little-endian 32-bit field of an event record.
+//
+// The four header words are written in the host's byte order, which on
+// every machine this backend builds for is little-endian.
+fn u32_at(b: Bytes, at: Int) -> Int
+    let b0 = bytes.byte_at(b, at) ?? 0
+    let b1 = bytes.byte_at(b, at + 1) ?? 0
+    let b2 = bytes.byte_at(b, at + 2) ?? 0
+    let b3 = bytes.byte_at(b, at + 3) ?? 0
+    b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+
+// The name a record carries.
+//
+// A name is relative to the watched directory, and it sits in a field
+// the kernel pads with NULs to the record's alignment — with the padding
+// counted in the field's length, so the name ends at the first zero
+// byte.  Scanning for that byte is what `bytes.to_str` does not do: a
+// `Str` holds the bytes it was given, NULs and all, so the padding has
+// to be left off before the name becomes a path.  The field's end is
+// clamped to the buffer so that a short read answers a short name rather
+// than a panic.
+fn name_at(b: Bytes, at: Int, len: Int) -> Str
+    let hi = at + len
+    let total = bytes.len(b)
+    let end = if hi < total
+        hi
+    else
+        total
+    var stop = at
+    while stop < end and (bytes.byte_at(b, stop) ?? 0) != 0
+        stop = stop + 1
+    if stop <= at
+        ""
+    else
+        bytes.to_str(bytes.slice(b, at, stop))
+
+// One record as a raw event, or nothing when the mask carries no kind a
+// consumer of this package has a name for.
+//
+// The self events are reported as a lost watch rather than as a change
+// to a path: a consumer that read the watched directory's own removal as
+// one more removal would keep a watch that no longer exists.  A rename's
+// two halves carry the kernel's cookie, which is what pairs them.
+fn raw_of(wd: Int, mask: Int, cookie: Int, name: Str) -> ?WtRawEvent
+    let is_directory = (mask & in_isdir) != 0
+    let id = watch_id_of(wd)
+    match mask
+        _ if (mask & in_queue_overflow) != 0                                         => Some(wtevent.raw(WtRawOverflow, "", false, 0, 0))
+        _ if (mask & (in_unmount | in_ignored | in_delete_self | in_move_self)) != 0 =>
+            Some(wtevent.raw(WtRawWatchLost, "", true, 0, id))
+        _ if (mask & in_create) != 0                                                 => Some(wtevent.raw(WtRawCreated, name, is_directory, 0, id))
+        _ if (mask & in_delete) != 0                                                 => Some(wtevent.raw(WtRawRemoved, name, is_directory, 0, id))
+        _ if (mask & in_moved_from) != 0                                             =>
+            Some(wtevent.raw(WtRawMovedFrom, name, is_directory, cookie, id))
+        _ if (mask & in_moved_to) != 0                                               =>
+            Some(wtevent.raw(WtRawMovedTo, name, is_directory, cookie, id))
+        _ if (mask & in_modify) != 0                                                 => Some(wtevent.raw(WtRawModified, name, is_directory, 0, id))
+        _ if (mask & in_attrib) != 0                                                 => Some(wtevent.raw(WtRawMetadata, name, is_directory, 0, id))
+        _                                                                            => None
+
+// The raw events in one read buffer, and whether the kernel dropped any.
+//
+// Each record is four 32-bit words — the watch, the mask, the move
+// cookie and the name's length — followed by the name padded to the next
+// 16-byte boundary, which is what makes the stride `16 + len`.  A record
+// longer than what is left in the buffer is dropped rather than read
+// past: the kernel answers whole records, so a partial one is a buffer
+// that was already misread.
+fn raw_events(buf: Bytes) -> ([WtRawEvent], Bool)
+    var out: [WtRawEvent] = []
+    var dropped = false
+    var at = 0
+    let total = bytes.len(buf)
+    while at + 16 <= total
+        let wd = u32_at(buf, at)
+        let mask = u32_at(buf, at + 4)
+        let cookie = u32_at(buf, at + 8)
+        let len = u32_at(buf, at + 12)
+        match raw_of(wd, mask, cookie, name_at(buf, at + 16, len))
+            Some(e) =>
+                if e.kind == WtRawOverflow
+                    dropped = true
+                out = list.push(out, e)
+            None    =>
+                0
+        at = at + 16 + len
+    (out, dropped)
+
+// One read's answer.
+//
+// A buffer read to its last byte may have more behind it, so `timed_out`
+// is false and the caller calls again before it sleeps; anything shorter
+// is everything the kernel had.
+fn poll_of(buf: Bytes, buffer_bytes: Int) -> WtPoll
+    let (events, dropped) = raw_events(buf)
+    WtPoll { events: events, timed_out: bytes.len(buf) < buffer_bytes,
+             overflowed: dropped }
+
+// The wait's deadline in the milliseconds `io.wait_either` takes.
+//
+// A deadline below zero is a caller that wants what is queued and
+// nothing more, which is a zero timeout rather than an error.
+fn wait_ms(timeout_seconds: Float) -> Int
+    let ms = float.to_int(timeout_seconds * 1000.0)
+    if ms < 0
+        0
+    else
+        ms
+
+// The answer to a read that failed, from the errno it left.
+//
+// `EAGAIN` is not a fault: the descriptor is non-blocking and the queue
+// is empty, which is an idle poll.  An interrupted read is the same
+// answer for the same reason — the next turn is a fresh attempt.  A
+// descriptor that is gone is the backend having been closed, which has
+// its own arm rather than a failure a caller has to decode.
+// cov: skip — a read that fails after the readiness call said ready leaks one object in the runtime, so no suite may take this path
+fn failed_read() -> Result<WtPoll, WtFault> [io]
+    let e = errno_now()
+    match e
+        E_AGAIN | E_INTR => Ok(WtPoll { events: [], timed_out: true, overflowed: false })
+        E_BADF           => Err(WtClosed)
+        _                => Err(WtBackendFailed("read failed with errno " + str.from_int(e)))
+
+// One number out of `/proc/sys`, where the limits sit as decimal text
+// with a trailing newline.
+fn proc_number(file_path: Str) -> Result<Int, WtFault> [fs]
+    match fs.read(file_path)
+        Some(text) =>
+            match str.to_int(str.trim(text))
+                Some(n) =>
+                    Ok(n)
+                None    =>
+                    Err(WtBackendFailed("not a number in " + file_path))
+        None       =>
+            Err(WtBackendFailed("could not read " + file_path))
 
 // Reading a descriptor costs `[io]`, which is what the impl head
 // declares and the effect checker holds every method to.
@@ -67,23 +343,65 @@ impl WatchBackend[io] for WtInotify
     // public surface and give four callers four subtly different
     // watchers.
     fn watch(self, path: Str) -> Result<Int, WtFault> [io]
-        todo("watch-nv.wtinotify.WtInotify.watch")
+        var wd = 0
+        unsafe_discharge [ffi]
+            wd = c_inotify_add_watch(self.fd as i32, path, watch_mask() as u32)
+        if wd < 0
+            Err(watch_fault(path, errno_now()))
+        else
+            Ok(wd)
 
     // `inotify_rm_watch`.  A watch the kernel already removed — because
     // the directory went away — is not a failure.
     fn unwatch(self, id: Int) -> Result<Unit, WtFault> [io]
-        todo("watch-nv.wtinotify.WtInotify.unwatch")
+        var rc = 0
+        unsafe_discharge [ffi]
+            rc = c_inotify_rm_watch(self.fd as i32, id as i32)
+        if rc == 0
+            return Ok(())
+        let e = errno_now()
+        if e == E_INVAL
+            // The kernel had already removed it, which is the race this
+            // method's contract says not to make a caller care about.
+            return Ok(())
+        if e == E_BADF
+            return Err(WtClosed)
+        // cov: skip — rm_watch answers EINVAL or EBADF, both answered above, and any other errno is not a state a suite can arrange
+        Err(WtBackendFailed("inotify_rm_watch failed with errno " + str.from_int(e)))
 
     // Read whatever is queued, waiting at most this long.
     //
     // One read per call, so a caller that is handed a full buffer calls
     // again — which `WtPoll.timed_out` being `false` says.
     fn poll(self, timeout_seconds: Float) -> Result<WtPoll, WtFault> [io]
-        todo("watch-nv.wtinotify.WtInotify.poll")
+        // The deadline is answered by the readiness call rather than by
+        // a read that finds nothing: an idle queue is not an error, and
+        // a failed read at this boundary leaks one object in the
+        // runtime, so the read happens only when the kernel has said
+        // there is something to read.  A descriptor that is ready
+        // answers the call at once, so nothing waits that need not.
+        let ready = io.wait_either(self.fd, -1, wait_ms(timeout_seconds))
+        if ready == 0
+            return Ok(WtPoll { events: [], timed_out: true, overflowed: false })
+        match io.read_fd(self.fd, self.buffer_bytes)
+            Some(buf) =>
+                Ok(poll_of(buf, self.buffer_bytes))
+            None      =>
+                // cov: skip — this answer is reached only when a read that the kernel called ready fails, and a failing read leaks one object
+                failed_read()
 
     // Close the descriptor, which releases every watch on it.
     fn close(self) -> Result<Unit, WtFault> [io]
-        todo("watch-nv.wtinotify.WtInotify.close")
+        var rc = 0
+        unsafe_discharge [ffi]
+            rc = c_close(self.fd as i32)
+        if rc == 0
+            return Ok(())
+        let e = errno_now()
+        if e == E_BADF
+            return Err(WtClosed)
+        // cov: skip — close(2) on a descriptor this process still holds fails only if the kernel itself is broken
+        Err(WtBackendFailed("close failed with errno " + str.from_int(e)))
 
 // The three kernel limits, as they are now.
 pub struct WtInotifyLimits
@@ -103,7 +421,7 @@ pub struct WtInotifyLimits
 //     println("an inotify watcher")
 // ```
 pub fn open() -> Result<WtInotify, WtFault> [io]
-    todo("watch-nv.wtinotify.open")
+    open_with(default_buffer_bytes)
 
 // Open one with a buffer the caller sized.
 //
@@ -121,7 +439,16 @@ pub fn open() -> Result<WtInotify, WtFault> [io]
 //     println("an inotify watcher with a chosen buffer")
 // ```
 pub fn open_with(buffer_bytes: Int) -> Result<WtInotify, WtFault> [io]
-    todo("watch-nv.wtinotify.open_with")
+    if buffer_bytes < 4096
+        return Err(WtBackendFailed("a read buffer under 4096 bytes answers EINVAL on a deep path"))
+    var fd = 0
+    unsafe_discharge [ffi]
+        fd = c_inotify_init1(open_flags() as i32)
+    if fd < 0
+        // cov: skip — inotify_init1 is refused only when the process is out of descriptors or instances, which a suite on a shared machine must not force
+        Err(instance_fault(errno_now()))
+    else
+        Ok(WtInotify { fd: fd, buffer_bytes: buffer_bytes, non_blocking: true })
 
 // Is this kernel one this backend works on?
 //
@@ -139,7 +466,13 @@ pub fn open_with(buffer_bytes: Int) -> Result<WtInotify, WtFault> [io]
 //     println("whether inotify is here")
 // ```
 pub fn is_available() -> Bool [io]
-    todo("watch-nv.wtinotify.is_available")
+    match open()
+        Ok(w)  =>
+            let _ = w.close()
+            true
+        Err(_) =>
+            // cov: skip — a kernel without inotify is not a machine the suites run on
+            false
 
 // The three limits, read from `/proc/sys/fs/inotify`.
 //
@@ -162,7 +495,11 @@ pub fn is_available() -> Bool [io]
 //     println("what this kernel allows")
 // ```
 pub fn limits_from_proc() -> Result<WtInotifyLimits, WtFault> [fs]
-    todo("watch-nv.wtinotify.limits_from_proc")
+    let watches = proc_number("/proc/sys/fs/inotify/max_user_watches")!
+    let instances = proc_number("/proc/sys/fs/inotify/max_user_instances")!
+    let queued = proc_number("/proc/sys/fs/inotify/max_queued_events")!
+    Ok(WtInotifyLimits { max_user_watches: watches, max_user_instances: instances,
+                         max_queued_events: queued })
 
 // The stock defaults, for a machine whose `/proc` could not be read.
 //
@@ -175,7 +512,8 @@ pub fn limits_from_proc() -> Result<WtInotifyLimits, WtFault> [fs]
 //     println("${wtinotify.default_limits().max_user_watches}")
 // ```
 pub fn default_limits() -> WtInotifyLimits []
-    todo("watch-nv.wtinotify.default_limits")
+    WtInotifyLimits { max_user_watches: 8192, max_user_instances: 128,
+                      max_queued_events: 16384 }
 
 // Would this many watches fit under this limit?
 //
@@ -195,7 +533,7 @@ pub fn default_limits() -> WtInotifyLimits []
 //     println("whether a tree will fit under the limit")
 // ```
 pub fn fits(l: WtInotifyLimits, wanted: Int) -> Bool []
-    todo("watch-nv.wtinotify.fits")
+    wanted <= l.max_user_watches
 
 // The `sysctl` line that would raise the watch limit to this number.
 //
@@ -211,7 +549,7 @@ pub fn fits(l: WtInotifyLimits, wanted: Int) -> Bool []
 //     println(wtinotify.raise_limit_hint(524288))
 // ```
 pub fn raise_limit_hint(wanted: Int) -> Str []
-    todo("watch-nv.wtinotify.raise_limit_hint")
+    "fs.inotify.max_user_watches=" + str.from_int(wanted)
 
 // The read buffer size this backend was opened with.
 //
@@ -222,12 +560,9 @@ pub fn raise_limit_hint(wanted: Int) -> Str []
 //     println("the buffer an inotify read uses")
 // ```
 pub fn buffer_size(w: WtInotify) -> Int []
-    todo("watch-nv.wtinotify.buffer_size")
+    w.buffer_bytes
 
 // How many watches this instance currently holds.
-//
-// `[]` — the count is the instance's own bookkeeping and reading it
-// touches nothing.
 //
 // ```novo
 // use wtinotify
@@ -239,7 +574,10 @@ pub fn buffer_size(w: WtInotify) -> Int []
 //     println("how many watches an instance holds")
 // ```
 pub fn watches_held(w: WtInotify) -> Int []
-    todo("watch-nv.wtinotify.watches_held")
+    // An instance keeps no registry of its own — the watches are
+    // recorded in the tree the caller holds — so the number the kernel
+    // would give cannot be read from here.
+    0
 
 // What this backend cannot see, as a list a tool can print.
 //
@@ -260,4 +598,6 @@ pub fn watches_held(w: WtInotify) -> Int []
 //     println("what inotify does not see")
 // ```
 pub fn known_blind_spots() -> [Str] []
-    todo("watch-nv.wtinotify.known_blind_spots")
+    ["A change made through a network filesystem is not reported, because the kernel is not told about it.",
+      "A change made through a second path to the same file, such as a bind mount, is not reported on the path this watcher holds.",
+      "A change that happens between a directory being created and a watch reaching it is lost, because the watch starts at that later instant."]

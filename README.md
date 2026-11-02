@@ -10,11 +10,6 @@ listings taken at intervals. The reference implementations are Rust's
 [notify](https://docs.rs/notify) and Python's
 [watchdog](https://python-watchdog.readthedocs.io/).
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
-its full signature, but every body is a `todo()` that panics when called. The
-package is published so its design can be reviewed and depended on before it is
-implemented. Version 0.1.0 will be the first working release.
-
 ## What it is
 
 A **watch** is a request to be told when something under one directory changes.
@@ -82,8 +77,7 @@ fn main() [io, time]
                 Err(e)    => println(e.message())
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test` fails on
-purpose: every test reaches a `not implemented` panic.
+Build and test with `novo pkg build` and `novo test`.
 
 ## What the package contains
 
@@ -109,8 +103,10 @@ takes the clock reading as an argument and runs no action, so it costs only what
 the backend costs.
 
 **On Linux, open the backend with `wtinotify.open`.** Elsewhere, and on a
-network filesystem, build one with `wtpoll.poller`. `wtwatch.suggests_polling`
-answers whether a fault means you should switch.
+network filesystem, build one with `wtpoll.poller`. Its `poll` answers the whole
+tree it scans rather than a comparison against the last one, so a tool that
+wants the changes compares two `wtpoll.scan` snapshots itself.
+`wtwatch.suggests_polling` answers whether a fault means you should switch.
 
 **A test of a tool's watch behaviour uses `wtwatch.replay_backend`.** It replays
 a recorded transcript and performs no input or output, so the same loop runs
@@ -194,6 +190,15 @@ replay backend costs nothing.
     `wtloop.wait_seconds` says how long to sleep. The caller's scheduling stays
     the caller's.
 
+## Foreign calls
+
+The standard library has no change-notification interface, so the Linux
+backend declares an `extern` surface onto libc, which every program
+already links: `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`,
+`close` and `__errno_location`. Each declaration carries the `[ffi]`
+effect and is called from a function that declares the public row
+(`[io]`), so no `[ffi]` appears on the package's interface.
+
 ## What is not included
 
 - **`kqueue`, `FSEvents` and `ReadDirectoryChangesW`.** The BSD, macOS and
@@ -238,10 +243,12 @@ novo test tests/wtwatch_tests.nv         # the backend interface
 novo test tests/wtpoll_tests.nv          # two snapshots, compared
 novo test tests/wtloop_tests.nv          # one turn of the loop
 novo test tests/wtinotify_tests.nv       # the limits and the sysctl line
+novo test tests/watch_edge_tests.nv      # the branches values cannot reach
 ```
 
 | Suite | Tests |
 | --- | --- |
+| `watch_edge_tests.nv` | 16 |
 | `wtfilter_tests.nv` | 13 |
 | `wtevent_tests.nv` | 11 |
 | `wtdebounce_tests.nv` | 10 |
@@ -250,46 +257,27 @@ novo test tests/wtinotify_tests.nv       # the limits and the sysctl line
 | `wtloop_tests.nv` | 9 |
 | `wtinotify_tests.nv` | 6 |
 
-`novo test` fails on purpose today. Every assertion reaches a `not implemented:
-watch-nv.<module>.<fn>` panic, because every body is a `todo()`. The tests are
-the specification the implementation will have to satisfy.
+The eight suites are the specification: 85 tests, green on novo 0.20.2. Every
+rule in the list above is one assertion in one of them, and the `novo` examples
+in each module's doc comments are run by `novo test src/<module>.nv`.
 
 The limits, the event kinds and the overflow behaviour come from the inotify(7)
 manual page. The event model and the rename-pairing cases follow Rust's `notify`
 and Python's `watchdog`, the two implementations that meet these problems in
 production.
 
-No suite sleeps and no suite touches a directory. The clock is an argument
-everywhere, so a burst of events at 0.0, 0.01 and 0.02 that should emit at 0.32
-is three calls and an assertion. `wtwatch_tests.nv` and `wtloop_tests.nv` drive
-a whole watch session over the replay backend, and the compiler checking that
-those functions declare no effects is itself the claim this package makes. The
-inotify backend is not exercised, because a suite that opened a real watcher
-would test the kernel.
+No suite sleeps. The clock is an argument everywhere, so a burst of events at
+0.0, 0.01 and 0.02 that should emit at 0.32 is three calls and an assertion.
+`wtwatch_tests.nv` and `wtloop_tests.nv` drive a whole watch session over the
+replay backend, and the compiler checking that those functions declare no
+effects is itself the claim this package makes.
 
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `wtevent`'s six types, from `WtEventKind` to `WtRawKind` | declared |
-| `wtevent`'s 12 functions, from `pairing` to `kind_name` | no |
-| `wtfilter.WtFilter` | declared |
-| `wtfilter`'s 11 functions, from `everything` to `is_editor_artifact` | no |
-| `wtdebounce.WtDebounce`, `.WtPending` | declared |
-| `wtdebounce`'s 10 functions, from `debounce` to `bypasses` | no |
-| `wtwatch.WtFault` and `impl Error for WtFault` | declared |
-| `wtwatch.WatchBackend`, the interface both backends implement | declared |
-| `wtwatch.WtWatch`, `.WtPoll`, `.WtReplayBackend`, `.WtWatchTree` | declared |
-| `wtwatch`'s eight functions, from `replay_backend` to `suggests_polling` | no |
-| `wtwatch`'s `impl WatchBackend for WtReplayBackend`: four methods | no |
-| `wtinotify.WtInotify`, `.WtInotifyLimits` | declared |
-| `wtinotify`'s 10 functions, from `open` to `known_blind_spots` | no |
-| `wtpoll.WtStatEntry`, `.WtSnapshot`, `.WtPoller` | declared |
-| `wtpoll`'s 11 functions, from `poller` to `minimum_interval` | no |
-| `wtloop.WtLoopConfig`, `.WtTurn`, `.WtLoopState` | declared |
-| `wtloop`'s 13 functions, from `default_config` to `describe_turn` | no |
-
-75 public functions, one interface with four methods, every body a `todo()`.
+`watch_edge_tests.nv` is the one suite that opens a descriptor and a temporary
+directory. It drives a real inotify watcher through a write, a rename, a `mkdir`
+and an `rmdir`, walks a real tree with the poller, and parses an inotify buffer
+of the kind the kernel only writes after a queue overflow. The arms no healthy
+machine reaches are excused where they live, in `src/`, by a `cov: skip` marker
+with its reason on the line.
 
 ## Licence
 

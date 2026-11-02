@@ -1,7 +1,5 @@
 // wtloop.nv — the shape a `--watch` mode is.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // EVERY `--watch` MODE IS THE SAME EIGHTY LINES, and every one of them
 // gets two of the same three things wrong.  Poll the backend; pair the
 // renames; filter; debounce; if anything survived, run the action; add
@@ -38,6 +36,7 @@
 // owning the decision.
 
 use wtdebounce
+use wtevent
 use wtfilter
 use wtwatch
 
@@ -88,7 +87,7 @@ pub struct WtTurn
 //     println("${wtloop.default_config().run_at_start}")
 // ```
 pub fn default_config() -> WtLoopConfig []
-    todo("watch-nv.wtloop.default_config")
+    config(wtfilter.everything())
 
 // A configuration over this filter.
 //
@@ -101,7 +100,9 @@ pub fn default_config() -> WtLoopConfig []
 //     println("${c.poll_seconds}")
 // ```
 pub fn config(f: WtFilter) -> WtLoopConfig []
-    todo("watch-nv.wtloop.config")
+    WtLoopConfig { filter: f, debounce: wtdebounce.default_debounce(),
+                   pairing: wtevent.default_pairing(), poll_seconds: 1.0,
+                   follow_new_directories: true, max_depth: 64, run_at_start: true }
 
 // The same configuration with a different debounce.
 //
@@ -115,7 +116,10 @@ pub fn config(f: WtFilter) -> WtLoopConfig []
 //     println("${c.debounce.quiet_seconds}")
 // ```
 pub fn with_debounce(c: WtLoopConfig, d: WtDebounce) -> WtLoopConfig []
-    todo("watch-nv.wtloop.with_debounce")
+    WtLoopConfig { filter: c.filter, debounce: d, pairing: c.pairing,
+                   poll_seconds: c.poll_seconds,
+                   follow_new_directories: c.follow_new_directories,
+                   max_depth: c.max_depth, run_at_start: c.run_at_start }
 
 // The same configuration with a different poll interval.
 //
@@ -126,7 +130,10 @@ pub fn with_debounce(c: WtLoopConfig, d: WtDebounce) -> WtLoopConfig []
 //     println("${wtloop.with_poll_interval(wtloop.default_config(), 0.25).poll_seconds}")
 // ```
 pub fn with_poll_interval(c: WtLoopConfig, seconds: Float) -> WtLoopConfig []
-    todo("watch-nv.wtloop.with_poll_interval")
+    WtLoopConfig { filter: c.filter, debounce: c.debounce, pairing: c.pairing,
+                   poll_seconds: seconds,
+                   follow_new_directories: c.follow_new_directories,
+                   max_depth: c.max_depth, run_at_start: c.run_at_start }
 
 // Watch a tree and run an action whenever it changes, until the action
 // says to stop.
@@ -160,7 +167,43 @@ pub fn with_poll_interval(c: WtLoopConfig, seconds: Float) -> WtLoopConfig []
 // ```
 pub fn run_on_change<B: WatchBackend[e]>(b: B, root: Str, c: WtLoopConfig,
                                          action: fn([WtEvent]) -> Bool [io]) -> Result<Int, WtFault> [e, io, time]
-    todo("watch-nv.wtloop.run_on_change")
+    var state = start(b, root, c)!
+    var going = true
+    if c.run_at_start
+        going = action([])
+    while going
+        let at_unix = now_unix()
+        let answered = step(b, state, at_unix)!
+        let turn = answered.0
+        let after = answered.1
+        state = after
+        if list.len(turn.events) > 0
+            going = action(turn.events)
+        if going
+            time.sleep(wait_seconds(state, at_unix))
+    let turns = state.turns
+    stop(b, state)!
+    Ok(turns)
+
+// The events in a batch after which the watcher's view is incomplete.
+//
+// `wtfilter.admits_event` never drops one, so these reach the caller
+// whatever the patterns say; the loop checks the raw batch as well,
+// because an overflow the backend flagged is one no event may carry.
+fn rescan_demands(events: [WtEvent]) -> [WtEvent]
+    var out: [WtEvent] = []
+    for e in events
+        if wtevent.demands_rescan(e)
+            out = list.push(out, e)
+    out
+
+// The faults a tree met after it held `from` of them.
+//
+// A turn reports what it met rather than everything the session has
+// ever met, or a `--watch` mode prints the same unreachable directory
+// every second for the rest of the run.
+fn faults_since(t: WtWatchTree, from: Int) -> [WtFault]
+    t.faults[from:]
 
 // One turn of the loop, with the clock reading supplied.
 //
@@ -183,7 +226,33 @@ pub fn run_on_change<B: WatchBackend[e]>(b: B, root: Str, c: WtLoopConfig,
 // ```
 pub fn step<B: WatchBackend[e]>(b: B, s: WtLoopState,
                                 now_unix: Float) -> Result<(WtTurn, WtLoopState), WtFault> [e]
-    todo("watch-nv.wtloop.step")
+    let polled = b.poll(s.config.poll_seconds)!
+    let (paired, pairing) = wtevent.pair(s.pairing, polled.events, now_unix)
+    let (aged, pairing) = wtevent.expire(pairing, now_unix)
+    let raw_batch = list.concat(paired, aged)
+    let admitted_batch = wtfilter.admitted(s.config.filter, raw_batch)
+    let (due, debounce) = wtdebounce.feed(s.debounce, admitted_batch, now_unix)
+    let demands = rescan_demands(raw_batch)
+    var tree = s.tree
+    var met: [WtFault] = []
+    let must_rescan = polled.overflowed or list.len(demands) > 0
+    if must_rescan
+        let fresh = rescan(b, s)!
+        tree = fresh.tree
+        met = list.concat(met, tree.faults)
+    let faults_before = list.len(tree.faults)
+    var added_count = 0
+    if s.config.follow_new_directories
+        for e in due
+            if e.kind == WtCreated and e.is_directory
+                let held = wtwatch.watch_count(tree)
+                tree = wtwatch.watch_new_directory(b, tree, e.path, s.config.filter, s.config.max_depth)
+                added_count = added_count + (wtwatch.watch_count(tree) - held)
+    met = list.concat(met, faults_since(tree, faults_before))
+    let turn = WtTurn { events: due, acted: false, rescanned: must_rescan,
+                        watches_added: added_count, faults: met }
+    Ok((turn, WtLoopState { config: s.config, tree: tree, debounce: debounce,
+                            pairing: pairing, root: s.root, turns: s.turns + 1 }))
 
 // The loop's state between turns.
 //
@@ -217,7 +286,10 @@ pub struct WtLoopState
 // ```
 pub fn start<B: WatchBackend[e]>(b: B, root: Str,
                                  c: WtLoopConfig) -> Result<WtLoopState, WtFault> [e]
-    todo("watch-nv.wtloop.start")
+    let placed = wtwatch.watch_tree(b, root, c.filter, c.max_depth)
+    Ok(WtLoopState { config: c, tree: placed, debounce: c.debounce,
+                     pairing: wtevent.pairing(c.pairing.window_seconds), root: root,
+                     turns: 0 })
 
 // Re-place every watch from scratch.
 //
@@ -237,7 +309,12 @@ pub fn start<B: WatchBackend[e]>(b: B, root: Str,
 //     println("the watches, re-placed")
 // ```
 pub fn rescan<B: WatchBackend[e]>(b: B, s: WtLoopState) -> Result<WtLoopState, WtFault> [e]
-    todo("watch-nv.wtloop.rescan")
+    // The tree is placed from the root again.  `watch` on a path that is
+    // already watched answers the same id, so the watches the session
+    // holds stay live in the kernel and the state keeps the fresh tree.
+    let placed = wtwatch.watch_tree(b, s.root, s.config.filter, s.config.max_depth)
+    Ok(WtLoopState { config: s.config, tree: placed, debounce: s.debounce,
+                     pairing: s.pairing, root: s.root, turns: s.turns })
 
 // End a session: remove every watch and close the backend.
 //
@@ -252,7 +329,11 @@ pub fn rescan<B: WatchBackend[e]>(b: B, s: WtLoopState) -> Result<WtLoopState, W
 //     println("a watch session, ended")
 // ```
 pub fn stop<B: WatchBackend[e]>(b: B, s: WtLoopState) -> Result<Unit, WtFault> [e]
-    todo("watch-nv.wtloop.stop")
+    let faults = wtwatch.unwatch_tree(b, s.tree)
+    let shut = b.close()!
+    if list.len(faults) > 0
+        return Err(faults[0])
+    Ok(())
 
 // How long the caller should wait before the next `step`.
 //
@@ -271,7 +352,19 @@ pub fn stop<B: WatchBackend[e]>(b: B, s: WtLoopState) -> Result<Unit, WtFault> [
 //     println("how long to wait before looking again")
 // ```
 pub fn wait_seconds(s: WtLoopState, now_unix: Float) -> Float []
-    todo("watch-nv.wtloop.wait_seconds")
+    let poll = s.config.poll_seconds
+    match wtdebounce.next_deadline(s.debounce)
+        None     =>
+            poll
+        Some(at) =>
+            let left = at - now_unix
+            if left < poll
+                if left < 0.0
+                    0.0
+                else
+                    left
+            else
+                poll
 
 // Did this turn do anything worth reporting?
 //
@@ -290,7 +383,15 @@ pub fn wait_seconds(s: WtLoopState, now_unix: Float) -> Float []
 //     println("whether a turn is worth a line of output")
 // ```
 pub fn turn_is_notable(t: WtTurn) -> Bool []
-    todo("watch-nv.wtloop.turn_is_notable")
+    if t.acted
+        return true
+    if t.rescanned
+        return true
+    if t.watches_added > 0
+        return true
+    if list.len(t.faults) > 0
+        return true
+    false
 
 // The clock, as Unix epoch seconds.
 //
@@ -309,7 +410,20 @@ pub fn turn_is_notable(t: WtTurn) -> Bool []
 //     println("one clock reading, where it is earned")
 // ```
 pub fn now_unix() -> Float [time]
-    todo("watch-nv.wtloop.now_unix")
+    time.now()
+
+// A count and a noun, singular or plural.
+//
+// The line a `--watch` mode prints goes to a person, and "1 events"
+// reads as a defect in the tool rather than as news about a file.  The
+// plural is spelled out rather than built from `noun`, because a watch
+// pluralises to watches and appending an "s" would print "watchs".
+fn counted(verb: Str, n: Int, noun: Str, plural: Str) -> Str
+    let word = if n == 1
+        noun
+    else
+        plural
+    verb + " " + str.from_int(n) + " " + word
 
 // A one-line summary of a turn, for a `--watch` mode's output.
 //
@@ -327,4 +441,12 @@ pub fn now_unix() -> Float [time]
 //     println("what a turn did, as one line")
 // ```
 pub fn describe_turn(t: WtTurn) -> Str []
-    todo("watch-nv.wtloop.describe_turn")
+    if t.acted
+        return counted("acted on", list.len(t.events), "event", "events")
+    if t.rescanned
+        return "rescanned: the watches were placed again"
+    if t.watches_added > 0
+        return counted("added", t.watches_added, "watch", "watches")
+    if list.len(t.faults) > 0
+        return counted("carried", list.len(t.faults), "fault", "faults")
+    "nothing to report"

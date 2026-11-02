@@ -1,8 +1,6 @@
 // wtevent.nv — what happened, and the three things a watcher has to be
 // able to say that a naive event model cannot.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A RENAME IS ONE EVENT WITH TWO PATHS, AND THE BACKEND DOES NOT SEND
 // IT THAT WAY.  inotify delivers a rename as two events — `MOVED_FROM`
 // and `MOVED_TO` sharing a cookie — which may arrive in separate reads,
@@ -135,6 +133,46 @@ pub enum WtRawKind
     WtRawOverflow
     WtRawWatchLost
 
+// The kind a raw event becomes when it is not a move half.
+//
+// The two move halves have no plain kind — they are what `pair` matches
+// against — and the arms here are the ones a caller gets if it asks
+// about one anyway: a lone half is reported at its own edge.
+//
+// The one raw event that carries no detail on the kind is an overflow,
+// which the kernel does not count, and a lost watch, whose reason is the
+// backend's to say rather than the stream's.  Both answer empty here.
+fn plain_kind(k: WtRawKind) -> WtEventKind
+    match k
+        WtRawCreated   => WtCreated
+        WtRawModified  => WtModified
+        WtRawMetadata  => WtMetadata
+        WtRawRemoved   => WtRemoved
+        WtRawMovedFrom => WtMovedOut
+        WtRawMovedTo   => WtMovedIn
+        WtRawOverflow  => WtOverflow(0)
+        WtRawWatchLost => WtWatchLost("")
+
+// A raw event that is not a move half, stamped with the batch's reading.
+fn plain_event(e: WtRawEvent, now_unix: Float) -> WtEvent
+    WtEvent { kind: plain_kind(e.kind), path: e.path, is_directory: e.is_directory,
+              at_unix: now_unix, watch_id: e.watch_id }
+
+// The pending half with this cookie, and the list without it.
+//
+// Taking it out rather than reading it leaves the state machine a value
+// it can answer, which is what keeps `pair` free of a flag that says
+// whether a half was still there.
+fn take_pending(pending: [WtPendingMove], cookie: Int) -> ([WtPendingMove], ?WtPendingMove)
+    var kept: [WtPendingMove] = []
+    var found: ?WtPendingMove = None
+    for m in pending
+        if found == None and m.cookie == cookie
+            found = Some(m)
+        else
+            kept = list.push(kept, m)
+    (kept, found)
+
 // A pairing state with this window.
 //
 // ```novo
@@ -144,7 +182,7 @@ pub enum WtRawKind
 //     println("${wtevent.pairing(0.5).window_seconds}")
 // ```
 pub fn pairing(window_seconds: Float) -> WtPairing []
-    todo("watch-nv.wtevent.pairing")
+    WtPairing { pending: [], window_seconds: window_seconds }
 
 // The default pairing window: half a second.
 //
@@ -159,7 +197,7 @@ pub fn pairing(window_seconds: Float) -> WtPairing []
 //     println("${wtevent.default_pairing().window_seconds}")
 // ```
 pub fn default_pairing() -> WtPairing []
-    todo("watch-nv.wtevent.default_pairing")
+    WtPairing { pending: [], window_seconds: 0.5 }
 
 // Feed a batch of raw events and drain the paired ones.
 //
@@ -181,7 +219,29 @@ pub fn default_pairing() -> WtPairing []
 //     println("raw events, paired")
 // ```
 pub fn pair(p: WtPairing, raw: [WtRawEvent], now_unix: Float) -> ([WtEvent], WtPairing) []
-    todo("watch-nv.wtevent.pair")
+    // The halves already waiting are carried over first, in the order
+    // they arrived, so a partner in this batch completes an older half.
+    var pending: [WtPendingMove] = list.clone(p.pending)
+    var out: [WtEvent] = []
+    for e in raw
+        if e.kind == WtRawMovedFrom
+            pending = list.push(pending, WtPendingMove { cookie: e.cookie, path: e.path,
+                                                         is_directory: e.is_directory,
+                                                         at_unix: now_unix,
+                                                         watch_id: e.watch_id })
+        else if e.kind == WtRawMovedTo
+            let (rest, partner) = take_pending(pending, e.cookie)
+            pending = rest[:]
+            match partner
+                Some(m) =>
+                    out = list.push(out, WtEvent { kind: WtRenamed(m.path, e.path), path: e.path,
+                                                   is_directory: e.is_directory,
+                                                   at_unix: now_unix, watch_id: e.watch_id })
+                None    =>
+                    out = list.push(out, plain_event(e, now_unix))
+        else
+            out = list.push(out, plain_event(e, now_unix))
+    (out, WtPairing { pending: pending, window_seconds: p.window_seconds })
 
 // Release the pending halves whose window has passed, as `WtMovedOut`.
 //
@@ -200,7 +260,16 @@ pub fn pair(p: WtPairing, raw: [WtRawEvent], now_unix: Float) -> ([WtEvent], WtP
 //     println("the moves whose partner never came")
 // ```
 pub fn expire(p: WtPairing, now_unix: Float) -> ([WtEvent], WtPairing) []
-    todo("watch-nv.wtevent.expire")
+    var pending: [WtPendingMove] = []
+    var out: [WtEvent] = []
+    for m in p.pending
+        if now_unix - m.at_unix >= p.window_seconds
+            out = list.push(out, WtEvent { kind: WtMovedOut, path: m.path,
+                                           is_directory: m.is_directory, at_unix: now_unix,
+                                           watch_id: m.watch_id })
+        else
+            pending = list.push(pending, m)
+    (out, WtPairing { pending: pending, window_seconds: p.window_seconds })
 
 // How many halves are waiting for a partner.
 //
@@ -214,7 +283,7 @@ pub fn expire(p: WtPairing, now_unix: Float) -> ([WtEvent], WtPairing) []
 //     println("${wtevent.pending_count(wtevent.default_pairing())}")
 // ```
 pub fn pending_count(p: WtPairing) -> Int []
-    todo("watch-nv.wtevent.pending_count")
+    list.len(p.pending)
 
 // An event.
 //
@@ -226,7 +295,8 @@ pub fn pending_count(p: WtPairing) -> Int []
 // ```
 pub fn event(kind: WtEventKind, path: Str, is_directory: Bool, at_unix: Float,
              watch_id: Int) -> WtEvent []
-    todo("watch-nv.wtevent.event")
+    WtEvent { kind: kind, path: path, is_directory: is_directory, at_unix: at_unix,
+              watch_id: watch_id }
 
 // A raw event, as a backend reports one.
 //
@@ -238,7 +308,8 @@ pub fn event(kind: WtEventKind, path: Str, is_directory: Bool, at_unix: Float,
 // ```
 pub fn raw(kind: WtRawKind, path: Str, is_directory: Bool, cookie: Int,
            watch_id: Int) -> WtRawEvent []
-    todo("watch-nv.wtevent.raw")
+    WtRawEvent { kind: kind, path: path, is_directory: is_directory, cookie: cookie,
+                 watch_id: watch_id }
 
 // Does this event mean a consumer must rescan?
 //
@@ -254,7 +325,10 @@ pub fn raw(kind: WtRawKind, path: Str, is_directory: Bool, cookie: Int,
 //     println("${wtevent.demands_rescan(wtevent.event(WtOverflow(0), "", true, 0.0, 1))}")
 // ```
 pub fn demands_rescan(e: WtEvent) -> Bool []
-    todo("watch-nv.wtevent.demands_rescan")
+    match e.kind
+        WtOverflow(_)  => true
+        WtWatchLost(_) => true
+        _              => false
 
 // Every path this event is about.
 //
@@ -272,7 +346,9 @@ pub fn demands_rescan(e: WtEvent) -> Bool []
 //     println("every path an event is about")
 // ```
 pub fn paths_of(e: WtEvent) -> [Str] []
-    todo("watch-nv.wtevent.paths_of")
+    match e.kind
+        WtRenamed(from, to) => [from, to]
+        _                   => [e.path]
 
 // Does this event mean the path now exists?
 //
@@ -287,7 +363,11 @@ pub fn paths_of(e: WtEvent) -> [Str] []
 //     println("${wtevent.is_appearance(wtevent.event(WtCreated, "a", false, 0.0, 1))}")
 // ```
 pub fn is_appearance(e: WtEvent) -> Bool []
-    todo("watch-nv.wtevent.is_appearance")
+    match e.kind
+        WtCreated       => true
+        WtMovedIn       => true
+        WtRenamed(_, _) => true
+        _               => false
 
 // Does this event mean the path no longer exists?
 //
@@ -300,7 +380,11 @@ pub fn is_appearance(e: WtEvent) -> Bool []
 //     println("${wtevent.is_disappearance(wtevent.event(WtRemoved, "a", false, 0.0, 1))}")
 // ```
 pub fn is_disappearance(e: WtEvent) -> Bool []
-    todo("watch-nv.wtevent.is_disappearance")
+    match e.kind
+        WtRemoved       => true
+        WtMovedOut      => true
+        WtRenamed(_, _) => true
+        _               => false
 
 // The kind as one lowercase word, for a log line or a `--json` output.
 //
@@ -311,4 +395,13 @@ pub fn is_disappearance(e: WtEvent) -> Bool []
 //     println(wtevent.kind_name(WtCreated))
 // ```
 pub fn kind_name(k: WtEventKind) -> Str []
-    todo("watch-nv.wtevent.kind_name")
+    match k
+        WtCreated       => "created"
+        WtModified      => "modified"
+        WtMetadata      => "metadata"
+        WtRemoved       => "removed"
+        WtRenamed(_, _) => "renamed"
+        WtMovedOut      => "moved_out"
+        WtMovedIn       => "moved_in"
+        WtOverflow(_)   => "overflow"
+        WtWatchLost(_)  => "watch_lost"

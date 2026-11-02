@@ -1,8 +1,6 @@
 // wtdebounce.nv — turning a burst of events into the one change that
 // happened.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // ONE SAVE IS FOUR TO SIX EVENTS, and that is the whole problem.  An
 // editor writing `main.nv` creates `main.nv~` or `.main.nv.swp`, writes
 // it, renames it over `main.nv`, and removes the lock — so a tool that
@@ -63,6 +61,77 @@ pub struct WtPending
     // wonder whether the watcher saw anything.
     folded: Int
 
+// Where this path's entry sits in the pending list, or `None`.
+//
+// Coalescing is per path, so every arriving event is a lookup first and
+// a new entry only when nothing is waiting for it.
+fn index_of(pending: [WtPending], path: Str) -> ?Int
+    var at = 0
+    for p in pending
+        if p.path == path
+            return Some(at)
+        at = at + 1
+    None
+
+// The same list with the entry at `at` replaced.
+fn replaced(pending: [WtPending], at: Int, p: WtPending) -> [WtPending]
+    var out: [WtPending] = []
+    var i = 0
+    for old in pending
+        if i == at
+            out = list.push(out, p)
+        else
+            out = list.push(out, old)
+        i = i + 1
+    out
+
+// One entry's event under a different kind, which is all coalescing
+// changes about it.
+fn retitled(e: WtEvent, k: WtEventKind) -> WtEvent
+    WtEvent { kind: k, path: e.path, is_directory: e.is_directory, at_unix: e.at_unix,
+              watch_id: e.watch_id }
+
+// The batch folded into what is already waiting, and the events that
+// went straight past the debouncer.
+//
+// An event is folded into the entry for its own path and resets that
+// entry's quiet window; the cap is measured from the entry's first
+// event, so folding can never postpone an emission for ever.
+fn fold_in(d: WtDebounce, events: [WtEvent], now_unix: Float) -> ([WtPending], [WtEvent])
+    var pending: [WtPending] = list.clone(d.pending)
+    var straight: [WtEvent] = []
+    for e in events
+        if bypasses(e)
+            straight = list.push(straight, e)
+        else
+            match index_of(pending, e.path)
+                None     =>
+                    pending = list.push(pending, WtPending { path: e.path, event: e,
+                                                             first_unix: now_unix,
+                                                             last_unix: now_unix, folded: 1 })
+                Some(at) =>
+                    let old = pending[at]
+                    let merged = WtPending { path: old.path, event: fold(old.event, e),
+                                             first_unix: old.first_unix, last_unix: now_unix,
+                                             folded: old.folded + 1 }
+                    pending = replaced(pending, at, merged)
+    (pending, straight)
+
+// Which entries are due at this instant, and which are still waiting.
+//
+// Due means the quiet window has passed since the last event for the
+// path, or the cap has passed since the first — whichever the entry
+// reaches first.
+fn split_ready(d: WtDebounce, pending: [WtPending], now_unix: Float) -> ([WtPending], [WtEvent])
+    var waiting: [WtPending] = []
+    var out: [WtEvent] = []
+    for p in pending
+        if now_unix - p.last_unix >= d.quiet_seconds or now_unix - p.first_unix >= d.max_seconds
+            out = list.push(out, p.event)
+        else
+            waiting = list.push(waiting, p)
+    (waiting, out)
+
 // A debouncer with these two windows.
 //
 // ```novo
@@ -72,7 +141,7 @@ pub struct WtPending
 //     println("${wtdebounce.debounce(0.3, 3.0).quiet_seconds}")
 // ```
 pub fn debounce(quiet_seconds: Float, max_seconds: Float) -> WtDebounce []
-    todo("watch-nv.wtdebounce.debounce")
+    WtDebounce { quiet_seconds: quiet_seconds, max_seconds: max_seconds, pending: [] }
 
 // The defaults: 300 milliseconds quiet, 3 seconds at most.
 //
@@ -87,7 +156,7 @@ pub fn debounce(quiet_seconds: Float, max_seconds: Float) -> WtDebounce []
 //     println("${wtdebounce.default_debounce().max_seconds}")
 // ```
 pub fn default_debounce() -> WtDebounce []
-    todo("watch-nv.wtdebounce.default_debounce")
+    WtDebounce { quiet_seconds: 0.3, max_seconds: 3.0, pending: [] }
 
 // Feed a batch and drain whatever is ready.
 //
@@ -111,7 +180,11 @@ pub fn default_debounce() -> WtDebounce []
 //     println("a burst of events, settled")
 // ```
 pub fn feed(d: WtDebounce, events: [WtEvent], now_unix: Float) -> ([WtEvent], WtDebounce) []
-    todo("watch-nv.wtdebounce.feed")
+    let (pending, straight) = fold_in(d, events, now_unix)
+    let (still, due) = split_ready(d, pending, now_unix)
+    let out = list.concat(straight, due)
+    (out, WtDebounce { quiet_seconds: d.quiet_seconds, max_seconds: d.max_seconds,
+                       pending: still })
 
 // Drain whatever is ready without feeding anything.
 //
@@ -130,7 +203,9 @@ pub fn feed(d: WtDebounce, events: [WtEvent], now_unix: Float) -> ([WtEvent], Wt
 //     println("what is ready now")
 // ```
 pub fn drain(d: WtDebounce, now_unix: Float) -> ([WtEvent], WtDebounce) []
-    todo("watch-nv.wtdebounce.drain")
+    let (still, due) = split_ready(d, d.pending, now_unix)
+    (due, WtDebounce { quiet_seconds: d.quiet_seconds, max_seconds: d.max_seconds,
+                       pending: still })
 
 // When the caller should look again, or `None` when nothing is waiting.
 //
@@ -150,7 +225,20 @@ pub fn drain(d: WtDebounce, now_unix: Float) -> ([WtEvent], WtDebounce) []
 //     println("when to wake up next")
 // ```
 pub fn next_deadline(d: WtDebounce) -> ?Float []
-    todo("watch-nv.wtdebounce.next_deadline")
+    var best: ?Float = None
+    for p in d.pending
+        let quiet_at = p.last_unix + d.quiet_seconds
+        let cap_at = p.first_unix + d.max_seconds
+        let due = if quiet_at < cap_at
+            quiet_at
+        else
+            cap_at
+        match best
+            Some(b) if b <= due =>
+                best = Some(b)
+            _                   =>
+                best = Some(due)
+    best
 
 // Everything waiting, emitted now, whatever the windows say.
 //
@@ -167,7 +255,8 @@ pub fn next_deadline(d: WtDebounce) -> ?Float []
 //     println("everything waiting, released")
 // ```
 pub fn flush(d: WtDebounce) -> ([WtEvent], WtDebounce) []
-    todo("watch-nv.wtdebounce.flush")
+    let out = list.map(d.pending, p => p.event)
+    (out, WtDebounce { quiet_seconds: d.quiet_seconds, max_seconds: d.max_seconds, pending: [] })
 
 // How many paths are waiting.
 //
@@ -178,7 +267,7 @@ pub fn flush(d: WtDebounce) -> ([WtEvent], WtDebounce) []
 //     println("${wtdebounce.pending_count(wtdebounce.default_debounce())}")
 // ```
 pub fn pending_count(d: WtDebounce) -> Int []
-    todo("watch-nv.wtdebounce.pending_count")
+    list.len(d.pending)
 
 // What is waiting for this path, if anything.
 //
@@ -195,7 +284,9 @@ pub fn pending_count(d: WtDebounce) -> Int []
 //     println("what is waiting for one path")
 // ```
 pub fn pending_for(d: WtDebounce, path: Str) -> ?WtPending []
-    todo("watch-nv.wtdebounce.pending_for")
+    match index_of(d.pending, path)
+        None     => None
+        Some(at) => Some(d.pending[at])
 
 // Fold two events for one path into the one a consumer should be told
 // about.
@@ -222,7 +313,13 @@ pub fn pending_for(d: WtDebounce, path: Str) -> ?WtPending []
 //     println("two events for one path, as one")
 // ```
 pub fn fold(earlier: WtEvent, later: WtEvent) -> WtEvent []
-    todo("watch-nv.wtdebounce.fold")
+    if later.kind == WtRemoved
+        return later
+    if earlier.kind == WtRemoved and wtevent.is_appearance(later)
+        return retitled(later, WtModified)
+    if earlier.kind == WtCreated and later.kind == WtModified
+        return retitled(later, WtCreated)
+    later
 
 // Would this event bypass the debouncer?
 //
@@ -240,4 +337,4 @@ pub fn fold(earlier: WtEvent, later: WtEvent) -> WtEvent []
 //     println("whether an event skips the debounce")
 // ```
 pub fn bypasses(e: WtEvent) -> Bool []
-    todo("watch-nv.wtdebounce.bypasses")
+    wtevent.demands_rescan(e)

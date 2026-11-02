@@ -1,8 +1,5 @@
 // wtpoll_tests.nv — two snapshots, compared, with no directory anywhere.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: watch-nv.wtpoll.<fn>`.
-//
 // THE mtime-WENT-BACKWARDS CASE IS THE ONE.  A checkout, a restore from
 // a backup and an `rsync --times` all write files whose mtime is OLDER
 // than what was there, and a comparison written `new > old` reports that
@@ -94,7 +91,7 @@ fn test_a_rename_arrives_as_a_removal_and_a_creation() [io]
 @test
 fn test_a_truncated_snapshot_says_so() [io]
     test.case("because comparing against one would report the rest as deleted")
-    test.assert(shot([], 1.0).truncated == false)
+    test.assert(not shot([], 1.0).truncated)
 
 @test
 fn test_the_paths_a_stat_comparison_cannot_settle_are_named() [io]
