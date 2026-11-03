@@ -5,11 +5,13 @@ All notable changes to watch-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## Unreleased
+## 0.1.0 — 2026-11-03
 
 ### Changed
 
 - The errno mappings and the inotify mask dispatch are `match` expressions (the errno constants are now upper-case `const` items, which a pattern compares rather than binds), and the debounce lookups (`index_of`, `next_deadline`) answer an optional rather than `-1`; no public signature or behaviour changes.
+
+This release requires novo 0.23.0 or later.
 
 ## 0.1.0 — 2026-10-11
 
@@ -128,6 +130,10 @@ should know before depending on them.
   `stat` result connects two paths, so the poller reports a removal and a
   creation rather than a rename.
 - **One dependency**, glob-nv, by registry range.
+
+## 0.0.4 — 2026-10-25
+
+A file that names a sibling module's type, function or constant now has the `use` line for that module (E2033, E2003).  No signature and no behaviour changed.
 
 ## 0.0.3 — 2026-09-25
 
